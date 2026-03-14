@@ -95,6 +95,7 @@ def compare_consensus_groups(
     rate=50_000,
     rounds=10,
     output_csv='results/consensus_fault_comparison_avg.csv',
+    output_runs_csv='results/consensus_fault_comparison_runs.csv',
 ):
     ''' Compare protocols on grouped faults with 16 nodes (faults=0,1,2,3), averaged over rounds '''
     node_params = {
@@ -110,6 +111,7 @@ def compare_consensus_groups(
     protocols = ['round_robin', 'common_coin']
     faults_group = [0, 1, 2, 3]
     results = {protocol: {} for protocol in protocols}
+    runs_rows = []
     rounds = int(rounds)
     if rounds <= 0:
         raise BenchError('rounds must be greater than 0')
@@ -135,7 +137,19 @@ def compare_consensus_groups(
                     current['consensus_protocol'] = protocol
                     parser = LocalBench(bench_params, current).run(debug)
                     print(parser.result())
-                    metrics_runs.append(parser.metrics())
+                    metrics = parser.metrics()
+                    metrics_runs.append(metrics)
+                    runs_rows.append(
+                        [
+                            run + 1,
+                            fault,
+                            protocol,
+                            f'{metrics["consensus_tps"]:.6f}',
+                            f'{metrics["consensus_latency_ms"]:.6f}',
+                            f'{metrics["end_to_end_tps"]:.6f}',
+                            f'{metrics["end_to_end_latency_ms"]:.6f}',
+                        ]
+                    )
 
                 results[protocol][fault] = {
                     'consensus_protocol': protocol,
@@ -197,6 +211,22 @@ def compare_consensus_groups(
                         ]
                     )
         print(f'Averaged metrics exported to {output_csv}')
+
+        with open(output_runs_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    'run',
+                    'fault',
+                    'protocol',
+                    'consensus_tps',
+                    'consensus_latency_ms',
+                    'end_to_end_tps',
+                    'end_to_end_latency_ms',
+                ]
+            )
+            writer.writerows(runs_rows)
+        print(f'Per-run metrics exported to {output_runs_csv}')
 
     except BenchError as e:
         Print.error(e)
