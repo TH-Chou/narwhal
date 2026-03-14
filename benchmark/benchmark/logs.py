@@ -128,6 +128,9 @@ class LogParser:
             'max_batch_delay': int(
                 search(r'Max batch delay .* (\d+)', log).group(1)
             ),
+            'consensus_protocol': search(
+                r'Consensus protocol set to ([a-z_]+)', log
+            ).group(1),
         }
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
@@ -195,6 +198,7 @@ class LogParser:
         sync_retry_nodes = self.configs[0]['sync_retry_nodes']
         batch_size = self.configs[0]['batch_size']
         max_batch_delay = self.configs[0]['max_batch_delay']
+        consensus_protocol = self.configs[0]['consensus_protocol']
 
         consensus_latency = self._consensus_latency() * 1_000
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
@@ -222,6 +226,7 @@ class LogParser:
             f' Sync retry nodes: {sync_retry_nodes:,} node(s)\n'
             f' batch size: {batch_size:,} B\n'
             f' Max batch delay: {max_batch_delay:,} ms\n'
+            f' Consensus protocol: {consensus_protocol}\n'
             '\n'
             ' + RESULTS:\n'
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
@@ -233,6 +238,19 @@ class LogParser:
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
             '-----------------------------------------\n'
         )
+
+    def metrics(self):
+        consensus_tps, _, _ = self._consensus_throughput()
+        consensus_latency = self._consensus_latency() * 1_000
+        end_to_end_tps, _, _ = self._end_to_end_throughput()
+        end_to_end_latency = self._end_to_end_latency() * 1_000
+        return {
+            'consensus_protocol': self.configs[0]['consensus_protocol'],
+            'consensus_tps': consensus_tps,
+            'consensus_latency_ms': consensus_latency,
+            'end_to_end_tps': end_to_end_tps,
+            'end_to_end_latency_ms': end_to_end_latency,
+        }
 
     def print(self, filename):
         assert isinstance(filename, str)

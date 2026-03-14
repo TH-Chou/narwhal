@@ -1,13 +1,18 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use ed25519_dalek as dalek;
+use ed25519_dalek::Digest as _;
 use ed25519_dalek::ed25519;
+use ed25519_dalek::Sha512;
 use ed25519_dalek::Signer as _;
 use rand::rngs::OsRng;
 use rand::{CryptoRng, RngCore};
+use rand::SeedableRng as _;
 use serde::{de, ser, Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::array::TryFromSliceError;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
+use threshold_crypto::{PublicKeySet, SecretKeySet, SignatureShare};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 
@@ -197,6 +202,10 @@ impl Signature {
             .expect("Unexpected signature length")
     }
 
+    pub fn to_bytes(&self) -> [u8; 64] {
+        self.flatten()
+    }
+
     pub fn verify(&self, digest: &Digest, public_key: &PublicKey) -> Result<(), CryptoError> {
         let signature = ed25519::signature::Signature::from_bytes(&self.flatten())?;
         let key = dalek::PublicKey::from_bytes(&public_key.0)?;
@@ -247,4 +256,85 @@ impl SignatureService {
             .await
             .expect("Failed to receive signature from Signature Service")
     }
+}
+
+fn coin_message(round: u64) -> Vec<u8> {
+    let mut message = b"narwhal-common-coin-v1".to_vec();
+    message.extend_from_slice(&round.to_le_bytes());
+    message
+}
+
+fn deterministic_coin_key_set(authorities: &[PublicKey], threshold: usize) -> SecretKeySet {
+    let mut sorted_authorities = authorities.to_vec();
+    sorted_authorities.sort();
+    let mut hasher = Sha512::new();
+    hasher.update(b"narwhal-threshold-coin-seed-v1");
+    for authority in sorted_authorities {
+        hasher.update(&authority);
+    }
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest[..32]);
+    let mut rng = rand::rngs::StdRng::from_seed(seed);
+    SecretKeySet::random(threshold, &mut rng)
+}
+
+fn authority_index(authorities: &[PublicKey], authority: &PublicKey) -> Option<usize> {
+    let mut sorted_authorities = authorities.to_vec();
+    sorted_authorities.sort();
+    sorted_authorities.iter().position(|name| name == authority)
+}
+
+pub fn coin_threshold(committee_size: usize) -> usize {
+    committee_size.saturating_sub(1) / 3
+}
+
+pub fn make_coin_share(
+    authorities: &[PublicKey],
+    threshold: usize,
+    authority: &PublicKey,
+    round: u64,
+) -> Option<Vec<u8>> {
+    let index = authority_index(authorities, authority)?;
+    let key_set = deterministic_coin_key_set(authorities, threshold);
+    let share = key_set.secret_key_share(index).sign(coin_message(round));
+    bincode::serialize(&share).ok()
+}
+
+pub fn recover_coin(
+    authorities: &[PublicKey],
+    threshold: usize,
+    round: u64,
+    shares: &[(PublicKey, Vec<u8>)],
+) -> Option<u64> {
+    let key_set = deterministic_coin_key_set(authorities, threshold);
+    let public_key_set: PublicKeySet = key_set.public_keys();
+    let message = coin_message(round);
+
+    let mut unique_shares = BTreeMap::new();
+    for (authority, bytes) in shares {
+        let index = match authority_index(authorities, authority) {
+            Some(index) => index,
+            None => continue,
+        };
+        let share: SignatureShare = match bincode::deserialize(bytes) {
+            Ok(share) => share,
+            Err(_) => continue,
+        };
+        if !public_key_set.public_key_share(index).verify(&share, &message) {
+            continue;
+        }
+        unique_shares.entry(index).or_insert(share);
+    }
+
+    if unique_shares.len() < threshold + 1 {
+        return None;
+    }
+
+    let signature = public_key_set.combine_signatures(&unique_shares).ok()?;
+    if !public_key_set.public_key().verify(&signature, &message) {
+        return None;
+    }
+    let bytes = signature.to_bytes();
+    Some(u64::from_le_bytes(bytes[..8].try_into().ok()?))
 }

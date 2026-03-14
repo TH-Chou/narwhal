@@ -101,11 +101,8 @@ pub fn serialized_batch() -> Vec<u8> {
 
 // Fixture
 pub fn batch_digest() -> Digest {
-    Digest(
-        Sha512::digest(&serialized_batch()).as_slice()[..32]
-            .try_into()
-            .unwrap(),
-    )
+    let hash = Sha512::digest(&serialized_batch());
+    Digest(hash[..32].try_into().unwrap())
 }
 
 // Fixture

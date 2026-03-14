@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use config::{Committee, Stake};
+use config::{Committee, ConsensusProtocol, Stake};
 use crypto::Hash as _;
-use crypto::{Digest, PublicKey};
+use crypto::{coin_threshold, recover_coin, Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use std::cmp::max;
@@ -67,6 +67,8 @@ pub struct Consensus {
     committee: Committee,
     /// The depth of the garbage collector.
     gc_depth: Round,
+    /// The consensus leader election mode.
+    consensus_protocol: ConsensusProtocol,
 
     /// Receives new certificates from the primary. The primary should send us new certificates only
     /// if it already sent us its whole history.
@@ -88,10 +90,29 @@ impl Consensus {
         tx_primary: Sender<Certificate>,
         tx_output: Sender<Certificate>,
     ) {
+        Self::spawn_with_protocol(
+            committee,
+            gc_depth,
+            ConsensusProtocol::RoundRobin,
+            rx_primary,
+            tx_primary,
+            tx_output,
+        );
+    }
+
+    pub fn spawn_with_protocol(
+        committee: Committee,
+        gc_depth: Round,
+        consensus_protocol: ConsensusProtocol,
+        rx_primary: Receiver<Certificate>,
+        tx_primary: Sender<Certificate>,
+        tx_output: Sender<Certificate>,
+    ) {
         tokio::spawn(async move {
             Self {
                 committee: committee.clone(),
                 gc_depth,
+                consensus_protocol,
                 rx_primary,
                 tx_primary,
                 tx_output,
@@ -133,7 +154,7 @@ impl Consensus {
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
+            let (leader_digest, leader) = match self.leader(leader_round, r, &state.dag) {
                 Some(x) => x,
                 None => continue,
             };
@@ -202,14 +223,28 @@ impl Consensus {
 
     /// Returns the certificate (and the certificate's digest) originated by the leader of the
     /// specified round (if any).
-    fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
-        // TODO: We should elect the leader of round r-2 using the common coin revealed at round r.
-        // At this stage, we are guaranteed to have 2f+1 certificates from round r (which is enough to
-        // compute the coin). We currently just use round-robin.
-        #[cfg(test)]
-        let coin = 0;
-        #[cfg(not(test))]
-        let coin = round;
+    fn leader<'a>(
+        &self,
+        round: Round,
+        coin_round: Round,
+        dag: &'a Dag,
+    ) -> Option<&'a (Digest, Certificate)> {
+        // We elect the leader of round r-2 using either:
+        // - round-robin (deterministic fallback), or
+        // - a reproducible common-coin value derived from round-r certificates.
+        let coin = match self.consensus_protocol {
+            ConsensusProtocol::RoundRobin => {
+                #[cfg(test)]
+                {
+                    0
+                }
+                #[cfg(not(test))]
+                {
+                    round
+                }
+            }
+            ConsensusProtocol::CommonCoin => self.common_coin(coin_round, dag)?,
+        };
 
         // Elect the leader.
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
@@ -218,6 +253,33 @@ impl Consensus {
 
         // Return its certificate and the certificate's digest.
         dag.get(&round).map(|x| x.get(&leader)).flatten()
+    }
+
+    fn common_coin(&self, round: Round, dag: &Dag) -> Option<Round> {
+        let certificates = dag.get(&round)?;
+        let quorum = self.committee.quorum_threshold() as usize;
+        let threshold = coin_threshold(self.committee.size());
+
+        let mut certificates: Vec<&Certificate> =
+            certificates.values().map(|(_, certificate)| certificate).collect();
+        certificates.sort_by_key(|certificate| certificate.digest());
+        if certificates.len() < quorum {
+            return None;
+        }
+
+        let authorities: Vec<PublicKey> = self.committee.authorities.keys().cloned().collect();
+        let mut shares = Vec::new();
+        for certificate in certificates.into_iter().take(quorum) {
+            if certificate.header.coin_share.is_empty() {
+                continue;
+            }
+            shares.push((
+                certificate.origin(),
+                certificate.header.coin_share.clone(),
+            ));
+        }
+
+        recover_coin(&authorities, threshold, round, &shares)
     }
 
     /// Order the past leaders that we didn't already commit.
@@ -229,7 +291,8 @@ impl Consensus {
             .step_by(2)
         {
             // Get the certificate proposed by the previous leader.
-            let (_, prev_leader) = match self.leader(r, &state.dag) {
+            let coin_round = r + 2;
+            let (_, prev_leader) = match self.leader(r, coin_round, &state.dag) {
                 Some(x) => x,
                 None => continue,
             };

@@ -163,20 +163,29 @@ class LocalCommittee(Committee):
 
 class NodeParameters:
     def __init__(self, json):
-        inputs = []
+        integer_inputs = []
         try:
-            inputs += [json['header_size']]
-            inputs += [json['max_header_delay']]
-            inputs += [json['gc_depth']]
-            inputs += [json['sync_retry_delay']]
-            inputs += [json['sync_retry_nodes']]
-            inputs += [json['batch_size']]
-            inputs += [json['max_batch_delay']]
+            integer_inputs += [json['header_size']]
+            integer_inputs += [json['max_header_delay']]
+            integer_inputs += [json['gc_depth']]
+            integer_inputs += [json['sync_retry_delay']]
+            integer_inputs += [json['sync_retry_nodes']]
+            integer_inputs += [json['batch_size']]
+            integer_inputs += [json['max_batch_delay']]
         except KeyError as e:
             raise ConfigError(f'Malformed parameters: missing key {e}')
 
-        if not all(isinstance(x, int) for x in inputs):
+        if not all(isinstance(x, int) for x in integer_inputs):
             raise ConfigError('Invalid parameters type')
+
+        if 'consensus_protocol' in json:
+            consensus_protocol = json['consensus_protocol']
+            if consensus_protocol not in ('round_robin', 'common_coin'):
+                raise ConfigError(
+                    'Invalid parameters: consensus_protocol must be round_robin or common_coin'
+                )
+        else:
+            json['consensus_protocol'] = 'round_robin'
 
         self.json = json
 

@@ -3,7 +3,7 @@ use crate::messages::{Certificate, Header};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
-use crypto::{Digest, PublicKey, SignatureService};
+use crypto::{coin_threshold, make_coin_share, Digest, PublicKey, SignatureService};
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
@@ -24,6 +24,10 @@ pub struct Proposer {
     header_size: usize,
     /// The maximum delay to wait for batches' digests.
     max_header_delay: u64,
+    /// Authorities used for threshold-coin shares.
+    coin_authorities: Vec<PublicKey>,
+    /// Threshold used for threshold-coin shares.
+    coin_threshold: usize,
 
     /// Receives the parents to include in the next header (along with their round number).
     rx_core: Receiver<(Vec<Digest>, Round)>,
@@ -58,6 +62,8 @@ impl Proposer {
             .iter()
             .map(|x| x.digest())
             .collect();
+        let coin_authorities: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
+        let coin_threshold = coin_threshold(committee.size());
 
         tokio::spawn(async move {
             Self {
@@ -65,6 +71,8 @@ impl Proposer {
                 signature_service,
                 header_size,
                 max_header_delay,
+                coin_authorities,
+                coin_threshold,
                 rx_core,
                 rx_workers,
                 tx_core,
@@ -79,12 +87,21 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
+        let coin_share = make_coin_share(
+            &self.coin_authorities,
+            self.coin_threshold,
+            &self.name,
+            self.round,
+        )
+        .unwrap_or_default();
+
         // Make a new header.
         let header = Header::new(
             self.name,
             self.round,
             self.digests.drain(..).collect(),
             self.last_parents.drain(..).collect(),
+            coin_share,
             &mut self.signature_service,
         )
         .await;

@@ -16,6 +16,7 @@ pub struct Header {
     pub round: Round,
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parents: BTreeSet<Digest>,
+    pub coin_share: Vec<u8>,
     pub id: Digest,
     pub signature: Signature,
 }
@@ -26,6 +27,7 @@ impl Header {
         round: Round,
         payload: BTreeMap<Digest, WorkerId>,
         parents: BTreeSet<Digest>,
+        coin_share: Vec<u8>,
         signature_service: &mut SignatureService,
     ) -> Self {
         let header = Self {
@@ -33,6 +35,7 @@ impl Header {
             round,
             payload,
             parents,
+            coin_share,
             id: Digest::default(),
             signature: Signature::default(),
         };
@@ -79,7 +82,9 @@ impl Hash for Header {
         for x in &self.parents {
             hasher.update(x);
         }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        hasher.update(&self.coin_share);
+        let digest = hasher.finalize();
+        Digest(digest[..32].try_into().unwrap())
     }
 }
 
@@ -148,7 +153,8 @@ impl Hash for Vote {
         hasher.update(&self.id);
         hasher.update(self.round.to_le_bytes());
         hasher.update(&self.origin);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        let digest = hasher.finalize();
+        Digest(digest[..32].try_into().unwrap())
     }
 }
 
@@ -229,7 +235,8 @@ impl Hash for Certificate {
         hasher.update(&self.header.id);
         hasher.update(self.round().to_le_bytes());
         hasher.update(&self.origin());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        let digest = hasher.finalize();
+        Digest(digest[..32].try_into().unwrap())
     }
 }
 
