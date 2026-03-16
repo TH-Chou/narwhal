@@ -1,4 +1,5 @@
-cargo build --quiet --release --features benchmark
+fab compare-consensus-groups --duration=30 --rounds=5 --rate=50000 --output-csv=results/my_avg.csv --output-runs-csv=results/my_runs.csv
+
 > **Note to readers:** MystenLabs is making this codebase production-ready [here](https://github.com/MystenLabs/sui/tree/main/narwhal).
 
 # Narwhal and Tusk

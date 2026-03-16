@@ -6,7 +6,7 @@ use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{unbounded_channel, Receiver, Sender, UnboundedSender};
 
 #[cfg(test)]
 #[path = "tests/consensus_tests.rs"]
@@ -14,6 +14,14 @@ pub mod consensus_tests;
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
+type CoinCache = HashMap<Round, Round>;
+
+struct CoinComputationInput {
+    round: Round,
+    authorities: Vec<PublicKey>,
+    threshold: usize,
+    shares: Vec<(PublicKey, Vec<u8>)>,
+}
 
 /// The state that needs to be persisted for crash-recovery.
 struct State {
@@ -126,9 +134,19 @@ impl Consensus {
     async fn run(&mut self) {
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
+        let mut coin_cache = CoinCache::new();
+        let mut pending_coin_rounds = HashSet::new();
+        let (coin_result_tx, mut coin_result_rx) = unbounded_channel::<(Round, Option<Round>)>();
 
         // Listen to incoming certificates.
         while let Some(certificate) = self.rx_primary.recv().await {
+            while let Ok((round, coin)) = coin_result_rx.try_recv() {
+                pending_coin_rounds.remove(&round);
+                if let Some(coin) = coin {
+                    coin_cache.insert(round, coin);
+                }
+            }
+
             debug!("Processing {:?}", certificate);
             let round = certificate.round();
 
@@ -138,6 +156,13 @@ impl Consensus {
                 .entry(round)
                 .or_insert_with(HashMap::new)
                 .insert(certificate.origin(), (certificate.digest(), certificate));
+            self.schedule_common_coin(
+                round,
+                &state.dag,
+                &mut pending_coin_rounds,
+                &coin_cache,
+                &coin_result_tx,
+            );
 
             // Try to order the dag to commit. Start from the highest round for which we have at least
             // 2f+1 certificates. This is because we need them to reveal the common coin.
@@ -154,7 +179,8 @@ impl Consensus {
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            let (leader_digest, leader) = match self.leader(leader_round, r, &state.dag) {
+            let (leader_digest, leader) = match self.leader(leader_round, r, &state.dag, &coin_cache)
+            {
                 Some(x) => x,
                 None => continue,
             };
@@ -180,7 +206,7 @@ impl Consensus {
             // Get an ordered list of past leaders that are linked to the current leader.
             debug!("Leader {:?} has enough support", leader);
             let mut sequence = Vec::new();
-            for leader in self.order_leaders(leader, &state).iter().rev() {
+            for leader in self.order_leaders(leader, &state, &coin_cache).iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
                 for x in self.order_dag(leader, &state) {
                     // Update and clean up internal state.
@@ -228,6 +254,7 @@ impl Consensus {
         round: Round,
         coin_round: Round,
         dag: &'a Dag,
+        coin_cache: &CoinCache,
     ) -> Option<&'a (Digest, Certificate)> {
         // We elect the leader of round r-2 using either:
         // - round-robin (deterministic fallback), or
@@ -243,7 +270,7 @@ impl Consensus {
                     round
                 }
             }
-            ConsensusProtocol::CommonCoin => self.common_coin(coin_round, dag)?,
+            ConsensusProtocol::CommonCoin => *coin_cache.get(&coin_round)?,
         };
 
         // Elect the leader.
@@ -255,7 +282,7 @@ impl Consensus {
         dag.get(&round).map(|x| x.get(&leader)).flatten()
     }
 
-    fn common_coin(&self, round: Round, dag: &Dag) -> Option<Round> {
+    fn common_coin_input(&self, round: Round, dag: &Dag) -> Option<CoinComputationInput> {
         let certificates = dag.get(&round)?;
         let quorum = self.committee.quorum_threshold() as usize;
         let threshold = coin_threshold(self.committee.size());
@@ -279,11 +306,52 @@ impl Consensus {
             ));
         }
 
-        recover_coin(&authorities, threshold, round, &shares)
+        Some(CoinComputationInput {
+            round,
+            authorities,
+            threshold,
+            shares,
+        })
+    }
+
+    fn schedule_common_coin(
+        &self,
+        round: Round,
+        dag: &Dag,
+        pending_coin_rounds: &mut HashSet<Round>,
+        coin_cache: &CoinCache,
+        coin_result_tx: &UnboundedSender<(Round, Option<Round>)>,
+    ) {
+        if !matches!(self.consensus_protocol, ConsensusProtocol::CommonCoin) {
+            return;
+        }
+        if coin_cache.contains_key(&round) || pending_coin_rounds.contains(&round) {
+            return;
+        }
+        let input = match self.common_coin_input(round, dag) {
+            Some(input) => input,
+            None => return,
+        };
+        pending_coin_rounds.insert(round);
+        let tx = coin_result_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let coin = recover_coin(
+                &input.authorities,
+                input.threshold,
+                input.round,
+                &input.shares,
+            );
+            let _ = tx.send((input.round, coin));
+        });
     }
 
     /// Order the past leaders that we didn't already commit.
-    fn order_leaders(&self, leader: &Certificate, state: &State) -> Vec<Certificate> {
+    fn order_leaders(
+        &self,
+        leader: &Certificate,
+        state: &State,
+        coin_cache: &CoinCache,
+    ) -> Vec<Certificate> {
         let mut to_commit = vec![leader.clone()];
         let mut leader = leader;
         for r in (state.last_committed_round + 2..=leader.round() - 2)
@@ -292,7 +360,7 @@ impl Consensus {
         {
             // Get the certificate proposed by the previous leader.
             let coin_round = r + 2;
-            let (_, prev_leader) = match self.leader(r, coin_round, &state.dag) {
+            let (_, prev_leader) = match self.leader(r, coin_round, &state.dag, coin_cache) {
                 Some(x) => x,
                 None => continue,
             };

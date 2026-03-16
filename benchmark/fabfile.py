@@ -97,7 +97,7 @@ def compare_consensus_groups(
     output_csv='results/consensus_fault_comparison_avg.csv',
     output_runs_csv='results/consensus_fault_comparison_runs.csv',
 ):
-    ''' Compare protocols on grouped faults with 16 nodes (faults=0,1,2,3), averaged over rounds '''
+    ''' Compare protocols on grouped faults with 16 nodes (faults=0,1,2,3,4,5), averaged over rounds '''
     node_params = {
         'header_size': 1_000,  # bytes
         'max_header_delay': 200,  # ms
@@ -109,7 +109,7 @@ def compare_consensus_groups(
     }
 
     protocols = ['round_robin', 'common_coin']
-    faults_group = [0, 1, 2, 3]
+    faults_group = [0, 1, 2, 3, 4, 5]
     results = {protocol: {} for protocol in protocols}
     runs_rows = []
     rounds = int(rounds)
