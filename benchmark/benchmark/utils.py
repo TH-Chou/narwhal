@@ -1,5 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from os.path import join
+from pathlib import Path
 
 
 class BenchError(Exception):
@@ -12,12 +13,20 @@ class BenchError(Exception):
 
 class PathMaker:
     @staticmethod
+    def benchmark_root():
+        return Path(__file__).resolve().parent.parent
+
+    @staticmethod
+    def workspace_root():
+        return PathMaker.benchmark_root().parent
+
+    @staticmethod
     def binary_path():
-        return join('..', 'target', 'release')
+        return str(PathMaker.workspace_root() / 'target' / 'release')
 
     @staticmethod
     def node_crate_path():
-        return join('..', 'node')
+        return str(PathMaker.workspace_root() / 'node')
 
     @staticmethod
     def committee_file():
