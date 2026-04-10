@@ -237,25 +237,53 @@ impl Core {
         // Ensure we have the parents. If at least one parent is missing, the synchronizer returns an empty
         // vector; it will gather the missing parents (as well as all ancestors) from other nodes and then
         // reschedule processing of this header.
-        let parents = self.synchronizer.get_parents(header).await?;
-        if parents.is_empty() {
+        let (parents_1, parents_2) = self.synchronizer.get_parents(header).await?;
+        if parents_1.is_empty() && !header.parents.is_empty() {
             debug!("Processing of {} suspended: missing parent(s)", header.id);
             return Ok(());
         }
 
-        // Check the parent certificates. Ensure the parents form a quorum and are all from the previous round.
-        let mut stake = 0;
-        for x in parents {
+        // Check first-hop parents (`r-1`).
+        let mut stake_1 = 0;
+        for x in &parents_1 {
             ensure!(
                 x.round() + 1 == header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
-            stake += self.committee.stake(&x.origin());
+            stake_1 += self.committee.stake(&x.origin());
         }
         ensure!(
-            stake >= self.committee.quorum_threshold(),
+            stake_1 >= self.committee.quorum_threshold(),
             DagError::HeaderRequiresQuorum(header.id.clone())
         );
+
+        // Check second-hop parents (`r-2`) and embedded QC requirements.
+        let mut stake_2 = 0;
+        for x in &parents_2 {
+            ensure!(
+                x.round() + 2 == header.round,
+                DagError::MalformedHeader(header.id.clone())
+            );
+            stake_2 += self.committee.stake(&x.origin());
+        }
+        if header.round >= 2 {
+            ensure!(
+                stake_2 >= self.committee.quorum_threshold(),
+                DagError::HeaderRequiresQuorum(header.id.clone())
+            );
+            let qc = header
+                .qc
+                .as_ref()
+                .ok_or_else(|| DagError::MalformedHeader(header.id.clone()))?;
+            ensure!(
+                qc.round + 1 == header.round,
+                DagError::MalformedHeader(header.id.clone())
+            );
+            ensure!(
+                header.parents.contains(&qc.target),
+                DagError::MalformedHeader(header.id.clone())
+            );
+        }
 
         // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
         // reschedule processing of this header once we have it.
@@ -276,7 +304,8 @@ impl Core {
             .insert(header.author)
         {
             // Make a vote and send it to the header's creator.
-            let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
+            let local_round = self.current_header.round.max(header.round);
+            let vote = Vote::new(header, local_round, &self.name, &mut self.signature_service).await;
             debug!("Created {:?}", vote);
             if vote.origin == self.name {
                 self.process_vote(vote)

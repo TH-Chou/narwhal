@@ -32,7 +32,7 @@ async fn process_header() {
     let mut store = Store::new(path).unwrap();
 
     // Make the vote we expect to receive.
-    let expected = Vote::new(&header(), &name, &mut signature_service).await;
+    let expected = Vote::new(&header(), header().round, &name, &mut signature_service).await;
 
     // Spawn a listener to receive the vote.
     let address = committee

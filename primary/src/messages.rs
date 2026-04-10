@@ -65,6 +65,23 @@ impl Header {
         // Ensure the header id is well formed.
         ensure!(self.digest() == self.id, DagError::InvalidHeaderId);
 
+        if self.round == 0 {
+            ensure!(
+                self.parents.is_empty() && self.parents_2.is_empty() && self.qc.is_none(),
+                DagError::MalformedHeader(self.id.clone())
+            );
+        } else if self.round == 1 {
+            ensure!(
+                self.parents_2.is_empty(),
+                DagError::MalformedHeader(self.id.clone())
+            );
+        } else {
+            ensure!(
+                !self.parents_2.is_empty() && self.qc.is_some(),
+                DagError::MalformedHeader(self.id.clone())
+            );
+        }
+
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
         ensure!(voting_rights > 0, DagError::UnknownAuthority(self.author));
@@ -85,7 +102,7 @@ impl Header {
         // If present, validate the embedded QC consistency and signatures.
         if let Some(qc) = &self.qc {
             ensure!(
-                qc.round < self.round,
+                qc.round + 1 == self.round,
                 DagError::MalformedHeader(self.id.clone())
             );
 
@@ -174,13 +191,14 @@ pub struct Vote {
 impl Vote {
     pub async fn new(
         header: &Header,
+        voter_round: Round,
         author: &PublicKey,
         signature_service: &mut SignatureService,
     ) -> Self {
         let vote = Self {
             id: header.id.clone(),
             round: header.round,
-            voter_round: header.round,
+            voter_round,
             origin: header.author,
             author: *author,
             signature: Signature::default(),

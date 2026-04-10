@@ -83,12 +83,16 @@ impl Synchronizer {
         Ok(true)
     }
 
-    /// Returns the parents of a header if we have them all. If at least one parent is missing,
-    /// we return an empty vector, synchronize with other nodes, and re-schedule processing
-    /// of the header for when we will have all the parents.
-    pub async fn get_parents(&mut self, header: &Header) -> DagResult<Vec<Certificate>> {
+    /// Returns both first-hop and second-hop parents of a header if we have them all. If at
+    /// least one parent is missing, we return empty vectors, synchronize with other nodes, and
+    /// re-schedule processing of the header for when we will have all the parents.
+    pub async fn get_parents(
+        &mut self,
+        header: &Header,
+    ) -> DagResult<(Vec<Certificate>, Vec<Certificate>)> {
         let mut missing = Vec::new();
-        let mut parents = Vec::new();
+        let mut parents_1 = Vec::new();
+        let mut parents_2 = Vec::new();
         for digest in &header.parents {
             if let Some(genesis) = self
                 .genesis
@@ -96,31 +100,62 @@ impl Synchronizer {
                 .find(|(x, _)| x == digest)
                 .map(|(_, x)| x)
             {
-                parents.push(genesis.clone());
+                parents_1.push(genesis.clone());
                 continue;
             }
 
             match self.store.read(digest.to_vec()).await? {
-                Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
+                Some(certificate) => parents_1.push(bincode::deserialize(&certificate)?),
+                None => missing.push(digest.clone()),
+            };
+        }
+
+        for digest in &header.parents_2 {
+            if let Some(genesis) = self
+                .genesis
+                .iter()
+                .find(|(x, _)| x == digest)
+                .map(|(_, x)| x)
+            {
+                parents_2.push(genesis.clone());
+                continue;
+            }
+
+            match self.store.read(digest.to_vec()).await? {
+                Some(certificate) => parents_2.push(bincode::deserialize(&certificate)?),
                 None => missing.push(digest.clone()),
             };
         }
 
         if missing.is_empty() {
-            return Ok(parents);
+            return Ok((parents_1, parents_2));
         }
 
         self.tx_header_waiter
             .send(WaiterMessage::SyncParents(missing, header.clone()))
             .await
             .expect("Failed to send sync parents request");
-        Ok(Vec::new())
+        Ok((Vec::new(), Vec::new()))
     }
 
     /// Check whether we have all the ancestors of the certificate. If we don't, send the certificate to
     /// the `CertificateWaiter` which will trigger re-processing once we have all the missing data.
     pub async fn deliver_certificate(&mut self, certificate: &Certificate) -> DagResult<bool> {
         for digest in &certificate.header.parents {
+            if self.genesis.iter().any(|(x, _)| x == digest) {
+                continue;
+            }
+
+            if self.store.read(digest.to_vec()).await?.is_none() {
+                self.tx_certificate_waiter
+                    .send(certificate.clone())
+                    .await
+                    .expect("Failed to send sync certificate request");
+                return Ok(false);
+            };
+        }
+
+        for digest in &certificate.header.parents_2 {
             if self.genesis.iter().any(|(x, _)| x == digest) {
                 continue;
             }

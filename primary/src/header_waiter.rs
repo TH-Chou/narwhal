@@ -232,6 +232,9 @@ impl HeaderWaiter {
                         for x in &header.parents {
                             let _ = self.parent_requests.remove(x);
                         }
+                        for x in &header.parents_2 {
+                            let _ = self.parent_requests.remove(x);
+                        }
                         self.tx_core.send(header).await.expect("Failed to send header");
                     },
                     Ok(None) => {
