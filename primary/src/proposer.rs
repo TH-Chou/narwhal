@@ -7,6 +7,7 @@ use crypto::{coin_threshold, make_coin_share, Digest, PublicKey, SignatureServic
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
+use std::collections::BTreeSet;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -101,6 +102,8 @@ impl Proposer {
             self.round,
             self.digests.drain(..).collect(),
             self.last_parents.drain(..).collect(),
+            BTreeSet::new(),
+            None,
             coin_share,
             &mut self.signature_service,
         )

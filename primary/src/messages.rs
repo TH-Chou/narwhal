@@ -11,11 +11,20 @@ use std::convert::TryInto;
 use std::fmt;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
+pub struct EmbeddedQc {
+    pub target: Digest,
+    pub round: Round,
+    pub votes: Vec<(PublicKey, Signature)>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Header {
     pub author: PublicKey,
     pub round: Round,
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parents: BTreeSet<Digest>,
+    pub parents_2: BTreeSet<Digest>,
+    pub qc: Option<EmbeddedQc>,
     pub coin_share: Vec<u8>,
     pub id: Digest,
     pub signature: Signature,
@@ -27,6 +36,8 @@ impl Header {
         round: Round,
         payload: BTreeMap<Digest, WorkerId>,
         parents: BTreeSet<Digest>,
+        parents_2: BTreeSet<Digest>,
+        qc: Option<EmbeddedQc>,
         coin_share: Vec<u8>,
         signature_service: &mut SignatureService,
     ) -> Self {
@@ -35,6 +46,8 @@ impl Header {
             round,
             payload,
             parents,
+            parents_2,
+            qc,
             coin_share,
             id: Digest::default(),
             signature: Signature::default(),
@@ -82,6 +95,13 @@ impl Hash for Header {
         for x in &self.parents {
             hasher.update(x);
         }
+        for x in &self.parents_2 {
+            hasher.update(x);
+        }
+        if let Some(qc) = &self.qc {
+            let bytes = bincode::serialize(qc).expect("Failed to serialize embedded QC");
+            hasher.update(bytes);
+        }
         hasher.update(&self.coin_share);
         let digest = hasher.finalize();
         Digest(digest[..32].try_into().unwrap())
@@ -111,6 +131,7 @@ impl fmt::Display for Header {
 pub struct Vote {
     pub id: Digest,
     pub round: Round,
+    pub voter_round: Round,
     pub origin: PublicKey,
     pub author: PublicKey,
     pub signature: Signature,
@@ -125,6 +146,7 @@ impl Vote {
         let vote = Self {
             id: header.id.clone(),
             round: header.round,
+            voter_round: header.round,
             origin: header.author,
             author: *author,
             signature: Signature::default(),
@@ -152,6 +174,7 @@ impl Hash for Vote {
         let mut hasher = Sha512::new();
         hasher.update(&self.id);
         hasher.update(self.round.to_le_bytes());
+        hasher.update(self.voter_round.to_le_bytes());
         hasher.update(&self.origin);
         let digest = hasher.finalize();
         Digest(digest[..32].try_into().unwrap())
@@ -162,9 +185,10 @@ impl fmt::Debug for Vote {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: V{}({}, {})",
+            "{}: V{}({}, {}, {})",
             self.digest(),
             self.round,
+            self.voter_round,
             self.author,
             self.id
         )

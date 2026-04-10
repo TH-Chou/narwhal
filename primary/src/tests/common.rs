@@ -142,6 +142,7 @@ pub fn votes(header: &Header) -> Vec<Vote> {
             let vote = Vote {
                 id: header.id.clone(),
                 round: header.round,
+                voter_round: header.round,
                 origin: header.author,
                 author,
                 signature: Signature::default(),

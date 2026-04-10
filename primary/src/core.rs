@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::aggregators::{CertificatesAggregator, VotesAggregator};
+use crate::aggregators::{ContinuousCertificatesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Vote};
 use crate::primary::{PrimaryMessage, Round};
@@ -61,7 +61,7 @@ pub struct Core {
     /// Aggregates votes into a certificate.
     votes_aggregator: VotesAggregator,
     /// Aggregates certificates to use as parents for new headers.
-    certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
+    certificates_aggregator: ContinuousCertificatesAggregator,
     /// A network sender to send the batches to the other workers.
     network: ReliableSender,
     /// Keeps the cancel handlers of the messages we sent.
@@ -105,7 +105,8 @@ impl Core {
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
                 current_header: Header::default(),
                 votes_aggregator: VotesAggregator::new(),
-                certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
+                // 维护一个连续的certificate聚合器，用于收集连续的certificate
+                certificates_aggregator: ContinuousCertificatesAggregator::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
@@ -277,17 +278,16 @@ impl Core {
         // Store the certificate.
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");
         self.store.write(certificate.digest().to_vec(), bytes).await;
-
-        // Check if we have enough certificates to enter a new dag round and propose a header.
-        if let Some(parents) = self
-            .certificates_aggregators
-            .entry(certificate.round())
-            .or_insert_with(|| Box::new(CertificatesAggregator::new()))
-            .append(certificate.clone(), &self.committee)?
+        // 检查是否收集到了足够的certificate来进入新的dag轮次并提出header
+        //这部分的更改主要是为了修改原有narwhal代码中收集2f+1个certificates为收集2f+1个wave certificates
+        // Check if we have enough certificates to enter one or more new dag rounds and propose headers.
+        for (parents, round) in self
+            .certificates_aggregator
+            .append(certificate.clone(), &self.committee)
         {
             // Send it to the `Proposer`.
             self.tx_proposer
-                .send((parents, certificate.round()))
+                .send((parents, round))
                 .await
                 .expect("Failed to send certificate");
         }
@@ -403,7 +403,6 @@ impl Core {
                 let gc_round = round - self.gc_depth;
                 self.last_voted.retain(|k, _| k >= &gc_round);
                 self.processing.retain(|k, _| k >= &gc_round);
-                self.certificates_aggregators.retain(|k, _| k >= &gc_round);
                 self.cancel_handlers.retain(|k, _| k >= &gc_round);
                 self.gc_round = gc_round;
             }

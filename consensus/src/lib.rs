@@ -16,6 +16,10 @@ pub mod consensus_tests;
 type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 type CoinCache = HashMap<Round, Round>;
 
+/// Number of DAG rounds in one consensus wave.
+/// Keep this even so the leader interval (`ROUNDS_PER_WAVE / 2`) is integral.
+const ROUNDS_PER_WAVE: Round = 4;
+
 struct CoinComputationInput {
     round: Round,
     authorities: Vec<PublicKey>,
@@ -91,6 +95,14 @@ pub struct Consensus {
 }
 
 impl Consensus {
+    fn leader_interval() -> Round {
+        ROUNDS_PER_WAVE / 2
+    }
+
+    fn leader_step() -> usize {
+        Self::leader_interval() as usize
+    }
+
     pub fn spawn(
         committee: Committee,
         gc_depth: Round,
@@ -132,6 +144,8 @@ impl Consensus {
     }
 
     async fn run(&mut self) {
+        debug_assert!(ROUNDS_PER_WAVE >= 2 && ROUNDS_PER_WAVE % 2 == 0);
+
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
         let mut coin_cache = CoinCache::new();
@@ -163,32 +177,35 @@ impl Consensus {
                 &coin_cache,
                 &coin_result_tx,
             );
-
+            //这部分的更新是把硬编码的轮次修改为从配置中读取，为接下来的wave长度更改做准备
             // Try to order the dag to commit. Start from the highest round for which we have at least
             // 2f+1 certificates. This is because we need them to reveal the common coin.
-            let r = round - 1;
+            let wave_end_round = round - 1;
+            let leader_interval = Self::leader_interval();
 
-            // We only elect leaders for even round numbers.
-            if r % 2 != 0 || r < 4 {
+            // We only elect leaders at wave boundaries.
+            if wave_end_round % leader_interval != 0 || wave_end_round < ROUNDS_PER_WAVE {
                 continue;
             }
 
-            // Get the certificate's digest of the leader of round r-2. If we already ordered this leader,
+            // Get the certificate's digest of the wave leader. If we already ordered this leader,
             // there is nothing to do.
-            let leader_round = r - 2;
+            let leader_round = wave_end_round - leader_interval;
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            let (leader_digest, leader) = match self.leader(leader_round, r, &state.dag, &coin_cache)
+            let (leader_digest, leader) =
+                match self.leader(leader_round, wave_end_round, &state.dag, &coin_cache)
             {
                 Some(x) => x,
                 None => continue,
             };
 
-            // Check if the leader has f+1 support from its children (ie. round r-1).
+            // Check if the leader has f+1 support from its children (ie. round leader_round + 1).
+            let support_round = leader_round + 1;
             let stake: Stake = state
                 .dag
-                .get(&(r - 1))
+                .get(&support_round)
                 .expect("We should have the whole history by now")
                 .values()
                 .filter(|(_, x)| x.header.parents.contains(&leader_digest))
@@ -354,12 +371,13 @@ impl Consensus {
     ) -> Vec<Certificate> {
         let mut to_commit = vec![leader.clone()];
         let mut leader = leader;
-        for r in (state.last_committed_round + 2..=leader.round() - 2)
+        let leader_interval = Self::leader_interval();
+        for r in (state.last_committed_round + leader_interval..=leader.round() - leader_interval)
             .rev()
-            .step_by(2)
+            .step_by(Self::leader_step())
         {
             // Get the certificate proposed by the previous leader.
-            let coin_round = r + 2;
+            let coin_round = r + leader_interval;
             let (_, prev_leader) = match self.leader(r, coin_round, &state.dag, coin_cache) {
                 Some(x) => x,
                 None => continue,
