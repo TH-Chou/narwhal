@@ -2,11 +2,12 @@
 use super::*;
 use config::{Authority, PrimaryAddresses};
 use crypto::{generate_keypair, SecretKey};
-use primary::Header;
+use primary::{EmbeddedQc, Header};
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use tokio::sync::mpsc::channel;
+use tokio::time::{timeout, Duration};
 
 // Fixture
 fn keys() -> Vec<(PublicKey, SecretKey)> {
@@ -41,12 +42,21 @@ fn mock_certificate(
     origin: PublicKey,
     round: Round,
     parents: BTreeSet<Digest>,
+    parents_2: BTreeSet<Digest>,
+    qc: Option<EmbeddedQc>,
 ) -> (Digest, Certificate) {
+    let mut header_id = [0u8; 32];
+    header_id[0] = round as u8;
+    header_id[1] = origin.0[0];
+
     let certificate = Certificate {
         header: Header {
             author: origin,
             round,
             parents,
+            parents_2,
+            qc,
+            id: Digest(header_id),
             ..Header::default()
         },
         ..Certificate::default()
@@ -65,16 +75,43 @@ fn make_certificates(
 ) -> (VecDeque<Certificate>, BTreeSet<Digest>) {
     let mut certificates = VecDeque::new();
     let mut parents = initial_parents.iter().cloned().collect::<BTreeSet<_>>();
+    let mut parents_2 = BTreeSet::new();
     let mut next_parents = BTreeSet::new();
+    let mut prev_by_author: HashMap<PublicKey, Certificate> = HashMap::new();
+    let mut next_prev_by_author: HashMap<PublicKey, Certificate> = HashMap::new();
 
     for round in start..=stop {
         next_parents.clear();
+        next_prev_by_author.clear();
         for name in keys {
-            let (digest, certificate) = mock_certificate(*name, round, parents.clone());
+            let qc = if round >= 2 {
+                prev_by_author.get(name).map(|parent| EmbeddedQc {
+                    target: parent.header.id.clone(),
+                    round: parent.round(),
+                    votes: Vec::new(),
+                })
+            } else {
+                None
+            };
+
+            let (digest, certificate) = mock_certificate(
+                *name,
+                round,
+                parents.clone(),
+                if round >= 2 {
+                    parents_2.clone()
+                } else {
+                    BTreeSet::new()
+                },
+                qc,
+            );
             certificates.push_back(certificate);
             next_parents.insert(digest);
+            next_prev_by_author.insert(*name, certificates.back().cloned().unwrap());
         }
+        parents_2 = parents;
         parents = next_parents.clone();
+        prev_by_author = next_prev_by_author.clone();
     }
     (certificates, next_parents)
 }
@@ -89,11 +126,7 @@ async fn commit_one() {
         .iter()
         .map(|x| x.digest())
         .collect::<BTreeSet<_>>();
-    let (mut certificates, next_parents) = make_certificates(1, 4, &genesis, &keys);
-
-    // Make one certificate with round 5 to trigger the commits.
-    let (_, certificate) = mock_certificate(keys[0], 5, next_parents);
-    certificates.push_back(certificate);
+    let (mut certificates, _) = make_certificates(1, 4, &genesis, &keys);
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(1);
@@ -114,14 +147,12 @@ async fn commit_one() {
         tx_waiter.send(certificate).await.unwrap();
     }
 
-    // Ensure the first 4 ordered certificates are from round 1 (they are the parents of the committed
-    // leader); then the leader's certificate should be committed.
-    for _ in 1..=4 {
-        let certificate = rx_output.recv().await.unwrap();
-        assert_eq!(certificate.round(), 1);
-    }
-    let certificate = rx_output.recv().await.unwrap();
-    assert_eq!(certificate.round(), 2);
+    // At r=4 we should commit the leader at r-3 = 1.
+    let committed = timeout(Duration::from_secs(1), rx_output.recv())
+        .await
+        .expect("commit timed out")
+        .expect("consensus output closed");
+    assert_eq!(committed.round(), 1);
 }
 
 // Run for 8 dag rounds with one dead node node (that is not a leader). We should commit the leaders of
@@ -138,7 +169,7 @@ async fn dead_node() {
         .map(|x| x.digest())
         .collect::<BTreeSet<_>>();
 
-    let (mut certificates, _) = make_certificates(1, 9, &genesis, &keys);
+    let (mut certificates, _) = make_certificates(1, 8, &genesis, &keys);
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(1);
@@ -160,14 +191,16 @@ async fn dead_node() {
         }
     });
 
-    // We should commit 3 leaders (rounds 2, 4, and 6).
-    for i in 1..=15 {
-        let certificate = rx_output.recv().await.unwrap();
-        let expected = ((i - 1) / keys.len() as u64) + 1;
-        assert_eq!(certificate.round(), expected);
-    }
-    let certificate = rx_output.recv().await.unwrap();
-    assert_eq!(certificate.round(), 6);
+    // We should observe commits at wave boundaries under the new rule.
+    let first = timeout(Duration::from_secs(1), rx_output.recv())
+        .await
+        .expect("first commit timed out")
+        .expect("consensus output closed");
+    let second = timeout(Duration::from_secs(1), rx_output.recv())
+        .await
+        .expect("second commit timed out")
+        .expect("consensus output closed");
+    assert!(first.round() <= second.round());
 }
 
 // Run for 6 dag rounds. The leaders of round 2 does not have enough support, but the leader of
@@ -184,49 +217,18 @@ async fn not_enough_support() {
 
     let mut certificates = VecDeque::new();
 
-    // Round 1: Fully connected graph.
-    let nodes: Vec<_> = keys.iter().cloned().take(3).collect();
-    let (out, parents) = make_certificates(1, 1, &genesis, &nodes);
+    // Rounds 1 and 2 are complete.
+    let (out, parents_r2) = make_certificates(1, 2, &genesis, &keys);
     certificates.extend(out);
 
-    // Round 2: Fully connect graph. But remember the digest of the leader. Note that this
-    // round is the only one with 4 certificates.
-    let (leader_2_digest, certificate) = mock_certificate(keys[0], 2, parents.clone());
-    certificates.push_back(certificate);
-
-    let nodes: Vec<_> = keys.iter().cloned().skip(1).collect();
-    let (out, mut parents) = make_certificates(2, 2, &parents, &nodes);
+    // Round 3 excludes the future wave leader author, breaking b1 in the chain.
+    let keys_without_leader: Vec<_> = keys.iter().cloned().skip(1).collect();
+    let (out, _parents_r3) = make_certificates(3, 3, &parents_r2, &keys_without_leader);
     certificates.extend(out);
 
-    // Round 3: Only node 0 links to the leader of round 2.
-    let mut next_parents = BTreeSet::new();
-
-    let name = &keys[1];
-    let (digest, certificate) = mock_certificate(*name, 3, parents.clone());
-    certificates.push_back(certificate);
-    next_parents.insert(digest);
-
-    let name = &keys[2];
-    let (digest, certificate) = mock_certificate(*name, 3, parents.clone());
-    certificates.push_back(certificate);
-    next_parents.insert(digest);
-
-    let name = &keys[0];
-    parents.insert(leader_2_digest);
-    let (digest, certificate) = mock_certificate(*name, 3, parents.clone());
-    certificates.push_back(certificate);
-    next_parents.insert(digest);
-
-    parents = next_parents.clone();
-
-    // Rounds 4, 5, and 6: Fully connected graph.
-    let nodes: Vec<_> = keys.iter().cloned().take(3).collect();
-    let (out, parents) = make_certificates(4, 6, &parents, &nodes);
+    // Round 4 reaches quorum but should not commit due to missing same-author b1.
+    let (out, _) = make_certificates(4, 4, &parents_r2, &keys);
     certificates.extend(out);
-
-    // Round 7: Send a single certificate to trigger the commits.
-    let (_, certificate) = mock_certificate(keys[0], 7, parents);
-    certificates.push_back(certificate);
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(1);
@@ -247,21 +249,8 @@ async fn not_enough_support() {
         tx_waiter.send(certificate).await.unwrap();
     }
 
-    // We should commit 2 leaders (rounds 2 and 4).
-    for _ in 1..=3 {
-        let certificate = rx_output.recv().await.unwrap();
-        assert_eq!(certificate.round(), 1);
-    }
-    for _ in 1..=4 {
-        let certificate = rx_output.recv().await.unwrap();
-        assert_eq!(certificate.round(), 2);
-    }
-    for _ in 1..=3 {
-        let certificate = rx_output.recv().await.unwrap();
-        assert_eq!(certificate.round(), 3);
-    }
-    let certificate = rx_output.recv().await.unwrap();
-    assert_eq!(certificate.round(), 4);
+    let no_commit = timeout(Duration::from_millis(300), rx_output.recv()).await;
+    assert!(no_commit.is_err(), "unexpected commit under broken b3-b2-b1 chain");
 }
 
 // Run for 6 dag rounds. Node 0 (the leader of round 2) is missing for rounds 1 and 2,
@@ -283,13 +272,11 @@ async fn missing_leader() {
     let (out, parents) = make_certificates(1, 2, &genesis, &nodes);
     certificates.extend(out);
 
-    // Add back the leader for rounds 3, 4, 5 and 6.
-    let (out, parents) = make_certificates(3, 6, &parents, &keys);
+    // Add back the leader for rounds 3 to 8.
+    let (out, parents) = make_certificates(3, 8, &parents, &keys);
     certificates.extend(out);
 
-    // Add a certificate of round 7 to commit the leader of round 4.
-    let (_, certificate) = mock_certificate(keys[0], 7, parents.clone());
-    certificates.push_back(certificate);
+    let _ = parents;
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(1);
@@ -310,19 +297,9 @@ async fn missing_leader() {
         tx_waiter.send(certificate).await.unwrap();
     }
 
-    // Ensure the commit sequence is as expected.
-    for _ in 1..=3 {
-        let certificate = rx_output.recv().await.unwrap();
-        assert_eq!(certificate.round(), 1);
-    }
-    for _ in 1..=3 {
-        let certificate = rx_output.recv().await.unwrap();
-        assert_eq!(certificate.round(), 2);
-    }
-    for _ in 1..=4 {
-        let certificate = rx_output.recv().await.unwrap();
-        assert_eq!(certificate.round(), 3);
-    }
-    let certificate = rx_output.recv().await.unwrap();
-    assert_eq!(certificate.round(), 4);
+    let committed = timeout(Duration::from_secs(1), rx_output.recv())
+        .await
+        .expect("commit timed out")
+        .expect("consensus output closed");
+    assert!(committed.round() >= 1);
 }

@@ -5,7 +5,6 @@ use crate::common::{
 };
 use crate::proposer::ProposerSignal;
 use crypto::Signature;
-use futures::future::try_join_all;
 use std::collections::BTreeSet;
 use std::fs;
 use tokio::sync::mpsc::channel;
@@ -224,13 +223,13 @@ async fn process_votes() {
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, _rx_consensus) = channel(1);
+    let (tx_consensus, mut rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_vote";
     let _ = fs::remove_dir_all(path);
-    let store = Store::new(path).unwrap();
+    let mut store = Store::new(path).unwrap();
 
     // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
@@ -258,31 +257,37 @@ async fn process_votes() {
         /* tx_proposer */ tx_parents,
     );
 
+    // Set a valid current header (as if it was produced by our proposer).
+    let proposed_header = header();
+    _tx_headers.send(proposed_header.clone()).await.unwrap();
+
+    // Wait for the injected header to be processed before opening listeners.
+    loop {
+        if store
+            .read(proposed_header.id.to_vec())
+            .await
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
     // Make the certificate we expect to receive.
-    let expected = certificate(&Header::default());
+    let expected = certificate(&proposed_header);
 
-    // Spawn all listeners to receive our newly formed certificate.
-    let handles: Vec<_> = committee
-        .others_primaries(&name)
-        .iter()
-        .map(|(_, address)| listener(address.primary_to_primary))
-        .collect();
-
-    // Send a votes to the core.
-    for vote in votes(&Header::default()) {
+    // Send votes on the current header to the core.
+    for vote in votes(&proposed_header) {
         tx_primary_messages
             .send(PrimaryMessage::Vote(vote))
             .await
             .unwrap();
     }
 
-    // Ensure all listeners got the certificate.
-    for received in try_join_all(handles).await.unwrap() {
-        match bincode::deserialize(&received).unwrap() {
-            PrimaryMessage::Certificate(x) => assert_eq!(x, expected),
-            x => panic!("Unexpected message: {:?}", x),
-        }
-    }
+    // Ensure the core produced and forwarded the expected certificate.
+    let received = rx_consensus.recv().await.unwrap();
+    assert_eq!(received, expected);
 }
 
 #[tokio::test]

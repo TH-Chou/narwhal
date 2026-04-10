@@ -243,46 +243,51 @@ impl Core {
             return Ok(());
         }
 
-        // Check first-hop parents (`r-1`).
-        let mut stake_1 = 0;
-        for x in &parents_1 {
+        if header.round == 0 {
+            // Genesis/initialization headers have no parent quorum requirements.
+            // Their structural validity has already been checked by `Header::verify`.
+        } else {
+            // Check first-hop parents (`r-1`).
+            let mut stake_1 = 0;
+            for x in &parents_1 {
+                ensure!(
+                    x.round() + 1 == header.round,
+                    DagError::MalformedHeader(header.id.clone())
+                );
+                stake_1 += self.committee.stake(&x.origin());
+            }
             ensure!(
-                x.round() + 1 == header.round,
-                DagError::MalformedHeader(header.id.clone())
-            );
-            stake_1 += self.committee.stake(&x.origin());
-        }
-        ensure!(
-            stake_1 >= self.committee.quorum_threshold(),
-            DagError::HeaderRequiresQuorum(header.id.clone())
-        );
-
-        // Check second-hop parents (`r-2`) and embedded QC requirements.
-        let mut stake_2 = 0;
-        for x in &parents_2 {
-            ensure!(
-                x.round() + 2 == header.round,
-                DagError::MalformedHeader(header.id.clone())
-            );
-            stake_2 += self.committee.stake(&x.origin());
-        }
-        if header.round >= 2 {
-            ensure!(
-                stake_2 >= self.committee.quorum_threshold(),
+                stake_1 >= self.committee.quorum_threshold(),
                 DagError::HeaderRequiresQuorum(header.id.clone())
             );
-            let qc = header
-                .qc
-                .as_ref()
-                .ok_or_else(|| DagError::MalformedHeader(header.id.clone()))?;
-            ensure!(
-                qc.round + 1 == header.round,
-                DagError::MalformedHeader(header.id.clone())
-            );
-            ensure!(
-                header.parents.contains(&qc.target),
-                DagError::MalformedHeader(header.id.clone())
-            );
+
+            // Check second-hop parents (`r-2`) and embedded QC requirements.
+            let mut stake_2 = 0;
+            for x in &parents_2 {
+                ensure!(
+                    x.round() + 2 == header.round,
+                    DagError::MalformedHeader(header.id.clone())
+                );
+                stake_2 += self.committee.stake(&x.origin());
+            }
+            if header.round >= 2 {
+                ensure!(
+                    stake_2 >= self.committee.quorum_threshold(),
+                    DagError::HeaderRequiresQuorum(header.id.clone())
+                );
+                let qc = header
+                    .qc
+                    .as_ref()
+                    .ok_or_else(|| DagError::MalformedHeader(header.id.clone()))?;
+                ensure!(
+                    qc.round + 1 == header.round,
+                    DagError::MalformedHeader(header.id.clone())
+                );
+                ensure!(
+                    header.parents.contains(&qc.target),
+                    DagError::MalformedHeader(header.id.clone())
+                );
+            }
         }
 
         // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
