@@ -133,7 +133,7 @@ impl Hash for Header {
             hasher.update(qc.round.to_le_bytes());
             for (name, signature) in &qc.votes {
                 hasher.update(name);
-                hasher.update(signature);
+                hasher.update(signature.to_bytes());
             }
         }
         hasher.update(&self.coin_share);
