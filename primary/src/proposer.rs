@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Certificate, Header};
+use crate::messages::{Certificate, EmbeddedQc, Header};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
@@ -16,6 +16,14 @@ use tokio::time::{sleep, Duration, Instant};
 pub mod proposer_tests;
 
 /// The proposer creates new headers and send them to the core for broadcasting and further processing.
+#[derive(Clone, Debug)]
+pub struct ProposerSignal {
+    pub round: Round,
+    pub parents_1: Vec<Digest>,
+    pub parents_2: Vec<Digest>,
+    pub qc: Option<EmbeddedQc>,
+}
+
 pub struct Proposer {
     /// The public key of this primary.
     name: PublicKey,
@@ -29,9 +37,11 @@ pub struct Proposer {
     coin_authorities: Vec<PublicKey>,
     /// Threshold used for threshold-coin shares.
     coin_threshold: usize,
+    /// Quorum threshold used by construction rules.
+    quorum_threshold: usize,
 
-    /// Receives the parents to include in the next header (along with their round number).
-    rx_core: Receiver<(Vec<Digest>, Round)>,
+    /// Receives construction signals from `Core`.
+    rx_core: Receiver<ProposerSignal>,
     /// Receives the batches' digests from our workers.
     rx_workers: Receiver<(Digest, WorkerId)>,
     /// Sends newly created headers to the `Core`.
@@ -39,8 +49,12 @@ pub struct Proposer {
 
     /// The current round of the dag.
     round: Round,
-    /// Holds the certificates' ids waiting to be included in the next header.
-    last_parents: Vec<Digest>,
+    /// Holds the first-hop parents (`r-1`) waiting to be included in the next header.
+    parents_1: Vec<Digest>,
+    /// Holds the second-hop parents (`r-2`) waiting to be included in the next header.
+    parents_2: Vec<Digest>,
+    /// Holds the QC of our previous-round block.
+    last_qc: Option<EmbeddedQc>,
     /// Holds the batches' digests waiting to be included in the next header.
     digests: Vec<(Digest, WorkerId)>,
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
@@ -55,7 +69,7 @@ impl Proposer {
         signature_service: SignatureService,
         header_size: usize,
         max_header_delay: u64,
-        rx_core: Receiver<(Vec<Digest>, Round)>,
+        rx_core: Receiver<ProposerSignal>,
         rx_workers: Receiver<(Digest, WorkerId)>,
         tx_core: Sender<Header>,
     ) {
@@ -65,6 +79,7 @@ impl Proposer {
             .collect();
         let coin_authorities: Vec<PublicKey> = committee.authorities.keys().cloned().collect();
         let coin_threshold = coin_threshold(committee.size());
+        let quorum_threshold = committee.quorum_threshold() as usize;
 
         tokio::spawn(async move {
             Self {
@@ -74,11 +89,14 @@ impl Proposer {
                 max_header_delay,
                 coin_authorities,
                 coin_threshold,
+                quorum_threshold,
                 rx_core,
                 rx_workers,
                 tx_core,
                 round: 1,
-                last_parents: genesis,
+                parents_1: genesis,
+                parents_2: Vec::new(),
+                last_qc: None,
                 digests: Vec::with_capacity(2 * header_size),
                 payload_size: 0,
             }
@@ -101,9 +119,9 @@ impl Proposer {
             self.name,
             self.round,
             self.digests.drain(..).collect(),
-            self.last_parents.drain(..).collect(),
-            BTreeSet::new(),
-            None,
+            self.parents_1.drain(..).collect::<BTreeSet<_>>(),
+            self.parents_2.drain(..).collect::<BTreeSet<_>>(),
+            self.last_qc.clone(),
             coin_share,
             &mut self.signature_service,
         )
@@ -136,10 +154,12 @@ impl Proposer {
             // 1. We have a quorum of certificates from the previous round and enough batches' digests;
             // 2. We have a quorum of certificates from the previous round and the specified maximum
             // inter-header delay has passed.
-            let enough_parents = !self.last_parents.is_empty();
+            let enough_parents_1 = !self.parents_1.is_empty();
+            let enough_parents_2 = self.round < 2 || self.parents_2.len() >= self.quorum_threshold;
+            let enough_qc = self.round < 2 || self.last_qc.is_some();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
-            if (timer_expired || enough_digests) && enough_parents {
+            if (timer_expired || enough_digests) && enough_parents_1 && enough_parents_2 && enough_qc {
                 // Make a new header.
                 self.make_header().await;
                 self.payload_size = 0;
@@ -150,17 +170,16 @@ impl Proposer {
             }
 
             tokio::select! {
-                Some((parents, round)) = self.rx_core.recv() => {
-                    if round < self.round {
+                Some(signal) = self.rx_core.recv() => {
+                    if signal.round < self.round {
                         continue;
                     }
 
-                    // Advance to the next round.
-                    self.round = round + 1;
+                    self.round = signal.round;
+                    self.parents_1 = signal.parents_1;
+                    self.parents_2 = signal.parents_2;
+                    self.last_qc = signal.qc;
                     debug!("Dag moved to round {}", self.round);
-
-                    // Signal that we have enough parent certificates to propose a new header.
-                    self.last_parents = parents;
                 }
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
                     self.payload_size += digest.size();

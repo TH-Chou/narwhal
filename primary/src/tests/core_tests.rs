@@ -3,6 +3,7 @@ use super::*;
 use crate::common::{
     certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
 };
+use crate::proposer::ProposerSignal;
 use futures::future::try_join_all;
 use std::fs;
 use tokio::sync::mpsc::channel;
@@ -343,8 +344,24 @@ async fn process_certificates() {
 
     // Ensure the core sends the parents of the certificates to the proposer.
     let received = rx_parents.recv().await.unwrap();
-    let parents = certificates.iter().map(|x| x.digest()).collect();
-    assert_eq!(received, (parents, 1));
+    let parents_1 = certificates.iter().map(|x| x.digest()).collect();
+    let expected = ProposerSignal {
+        round: 2,
+        parents_1,
+        parents_2: Certificate::genesis(&committee())
+            .iter()
+            .map(|x| x.digest())
+            .collect(),
+        qc: Some(crate::messages::EmbeddedQc {
+            target: certificate(&headers()[0]).header.id,
+            round: 1,
+            votes: certificate(&headers()[0]).votes,
+        }),
+    };
+    assert_eq!(received.round, expected.round);
+    assert_eq!(received.parents_1.len(), expected.parents_1.len());
+    assert_eq!(received.parents_2.len(), expected.parents_2.len());
+    assert!(received.qc.is_some());
 
     // Ensure the core sends the certificates to the consensus.
     for x in certificates.clone() {

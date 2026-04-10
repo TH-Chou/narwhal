@@ -1,8 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::aggregators::{ContinuousCertificatesAggregator, VotesAggregator};
+use crate::aggregators::VotesAggregator;
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, Header, Vote};
+use crate::messages::{Certificate, EmbeddedQc, Header, Vote};
 use crate::primary::{PrimaryMessage, Round};
+use crate::proposer::ProposerSignal;
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -47,8 +48,8 @@ pub struct Core {
     rx_proposer: Receiver<Header>,
     /// Output all certificates to the consensus layer.
     tx_consensus: Sender<Certificate>,
-    /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
-    tx_proposer: Sender<(Vec<Digest>, Round)>,
+    /// Send block-construction contexts to the `Proposer`.
+    tx_proposer: Sender<ProposerSignal>,
 
     /// The last garbage collected round.
     gc_round: Round,
@@ -60,8 +61,10 @@ pub struct Core {
     current_header: Header,
     /// Aggregates votes into a certificate.
     votes_aggregator: VotesAggregator,
-    /// Aggregates certificates to use as parents for new headers.
-    certificates_aggregator: ContinuousCertificatesAggregator,
+    /// Certificates observed per round keyed by authority.
+    certificates_by_round: HashMap<Round, HashMap<PublicKey, Certificate>>,
+    /// Next round whose completion we still need to signal to the proposer.
+    next_round_to_signal: Round,
     /// A network sender to send the batches to the other workers.
     network: ReliableSender,
     /// Keeps the cancel handlers of the messages we sent.
@@ -83,8 +86,13 @@ impl Core {
         rx_certificate_waiter: Receiver<Certificate>,
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<Certificate>,
-        tx_proposer: Sender<(Vec<Digest>, Round)>,
+        tx_proposer: Sender<ProposerSignal>,
     ) {
+        let genesis = Certificate::genesis(&committee);
+        let genesis_by_authority: HashMap<_, _> = genesis
+            .into_iter()
+            .map(|certificate| (certificate.origin(), certificate))
+            .collect();
         tokio::spawn(async move {
             Self {
                 name,
@@ -105,14 +113,92 @@ impl Core {
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
                 current_header: Header::default(),
                 votes_aggregator: VotesAggregator::new(),
-                // 维护一个连续的certificate聚合器，用于收集连续的certificate
-                certificates_aggregator: ContinuousCertificatesAggregator::new(),
+                certificates_by_round: [(0, genesis_by_authority)].iter().cloned().collect(),
+                next_round_to_signal: 1,
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()
             .await;
         });
+    }
+
+    fn certificate_to_embedded_qc(certificate: &Certificate) -> EmbeddedQc {
+        EmbeddedQc {
+            target: certificate.header.id.clone(),
+            round: certificate.round(),
+            votes: certificate.votes.clone(),
+        }
+    }
+
+    fn round_digests(&self, round: Round) -> Vec<Digest> {
+        self.certificates_by_round
+            .get(&round)
+            .map(|by_authority| by_authority.values().map(|x| x.digest()).collect())
+            .unwrap_or_default()
+    }
+
+    async fn try_signal_proposer(&mut self) {
+        loop {
+            let round = self.next_round_to_signal;
+            let Some(by_authority) = self.certificates_by_round.get(&round) else {
+                break;
+            };
+
+            let round_weight: u32 = by_authority
+                .keys()
+                .map(|name| self.committee.stake(name))
+                .sum();
+            if round_weight < self.committee.quorum_threshold() {
+                break;
+            }
+
+            let Some(own_certificate) = by_authority.get(&self.name) else {
+                break;
+            };
+
+            let parents_1 = self.round_digests(round);
+            if parents_1.is_empty() {
+                break;
+            }
+
+            let parents_2 = if round == 1 {
+                self.round_digests(0)
+            } else {
+                self.round_digests(round - 1)
+            };
+
+            let parents_2_weight: u32 = parents_2
+                .iter()
+                .filter_map(|digest| {
+                    self.certificates_by_round
+                        .get(&(if round == 1 { 0 } else { round - 1 }))
+                        .and_then(|by_authority| {
+                            by_authority
+                                .values()
+                                .find(|certificate| certificate.digest() == *digest)
+                                .map(|certificate| self.committee.stake(&certificate.origin()))
+                        })
+                })
+                .sum();
+            if round >= 2 && parents_2_weight < self.committee.quorum_threshold() {
+                break;
+            }
+
+            let signal = ProposerSignal {
+                round: round + 1,
+                parents_1,
+                parents_2,
+                qc: Some(Self::certificate_to_embedded_qc(own_certificate)),
+            };
+
+            self.tx_proposer
+                .send(signal)
+                .await
+                .expect("Failed to send certificate");
+
+            self.next_round_to_signal += 1;
+        }
     }
 
     async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
@@ -278,19 +364,12 @@ impl Core {
         // Store the certificate.
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");
         self.store.write(certificate.digest().to_vec(), bytes).await;
-        // 检查是否收集到了足够的certificate来进入新的dag轮次并提出header
-        //这部分的更改主要是为了修改原有narwhal代码中收集2f+1个certificates为收集2f+1个wave certificates
-        // Check if we have enough certificates to enter one or more new dag rounds and propose headers.
-        for (parents, round) in self
-            .certificates_aggregator
-            .append(certificate.clone(), &self.committee)
-        {
-            // Send it to the `Proposer`.
-            self.tx_proposer
-                .send((parents, round))
-                .await
-                .expect("Failed to send certificate");
-        }
+
+        self.certificates_by_round
+            .entry(certificate.round())
+            .or_insert_with(HashMap::new)
+            .insert(certificate.origin(), certificate.clone());
+        self.try_signal_proposer().await;
 
         // Send it to the consensus layer.
         let id = certificate.header.id.clone();
