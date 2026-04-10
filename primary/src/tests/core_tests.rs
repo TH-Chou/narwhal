@@ -4,7 +4,9 @@ use crate::common::{
     certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
 };
 use crate::proposer::ProposerSignal;
+use crypto::Signature;
 use futures::future::try_join_all;
+use std::collections::BTreeSet;
 use std::fs;
 use tokio::sync::mpsc::channel;
 
@@ -375,4 +377,176 @@ async fn process_certificates() {
         let serialized = bincode::serialize(x).unwrap();
         assert_eq!(stored, Some(serialized));
     }
+}
+
+#[tokio::test]
+async fn process_header_round_2_requires_qc() {
+    let (name, secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(secret);
+
+    let (tx_sync_headers, _rx_sync_headers) = channel(1);
+    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
+    let (tx_primary_messages, rx_primary_messages) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
+    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_consensus, _rx_consensus) = channel(1);
+    let (tx_parents, _rx_parents) = channel(1);
+
+    let path = ".db_test_process_header_round_2_requires_qc";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+
+    let synchronizer = Synchronizer::new(
+        name,
+        &committee(),
+        store.clone(),
+        tx_sync_headers,
+        tx_sync_certificates,
+    );
+
+    Core::spawn(
+        name,
+        committee(),
+        store.clone(),
+        synchronizer,
+        signature_service,
+        Arc::new(AtomicU64::new(0)),
+        50,
+        rx_primary_messages,
+        rx_headers_loopback,
+        rx_certificates_loopback,
+        rx_headers,
+        tx_consensus,
+        tx_parents,
+    );
+
+    let mut header = Header {
+        round: 2,
+        parents: Certificate::genesis(&committee())
+            .iter()
+            .map(|x| x.digest())
+            .collect(),
+        parents_2: Certificate::genesis(&committee())
+            .iter()
+            .map(|x| x.digest())
+            .collect(),
+        qc: None,
+        ..header()
+    };
+
+    let (_, author_secret) = keys()
+        .into_iter()
+        .find(|(pk, _)| *pk == header.author)
+        .unwrap();
+    header.id = header.digest();
+    header.signature = Signature::new(&header.id, &author_secret);
+    let id = header.id.clone();
+
+    tx_primary_messages
+        .send(PrimaryMessage::Header(header))
+        .await
+        .unwrap();
+
+    assert!(store.read(id.to_vec()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn process_header_round_2_rejects_qc_target_outside_parents_1() {
+    let (name, secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(secret);
+
+    let (tx_sync_headers, _rx_sync_headers) = channel(1);
+    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
+    let (tx_primary_messages, rx_primary_messages) = channel(1);
+    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
+    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_consensus, _rx_consensus) = channel(1);
+    let (tx_parents, _rx_parents) = channel(1);
+
+    let path = ".db_test_process_header_round_2_rejects_qc_target";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+
+    let synchronizer = Synchronizer::new(
+        name,
+        &committee(),
+        store.clone(),
+        tx_sync_headers,
+        tx_sync_certificates,
+    );
+
+    Core::spawn(
+        name,
+        committee(),
+        store.clone(),
+        synchronizer,
+        signature_service,
+        Arc::new(AtomicU64::new(0)),
+        50,
+        rx_primary_messages,
+        rx_headers_loopback,
+        rx_certificates_loopback,
+        rx_headers,
+        tx_consensus,
+        tx_parents,
+    );
+
+    let round_1_headers = headers();
+    let round_1_certificates: Vec<_> = round_1_headers.iter().map(certificate).collect();
+    for certificate in &round_1_certificates {
+        let bytes = bincode::serialize(certificate).unwrap();
+        store.write(certificate.digest().to_vec(), bytes).await;
+    }
+
+    let qc_source = round_1_certificates[0].clone();
+    let parents_1: BTreeSet<_> = round_1_certificates
+        .iter()
+        .skip(1)
+        .map(|x| x.digest())
+        .collect();
+    let parents_2: BTreeSet<_> = Certificate::genesis(&committee())
+        .iter()
+        .map(|x| x.digest())
+        .collect();
+
+    let mut header = Header {
+        author: qc_source.header.author,
+        round: 2,
+        parents: parents_1,
+        parents_2,
+        qc: Some(crate::messages::EmbeddedQc {
+            target: qc_source.header.id.clone(),
+            round: 1,
+            votes: qc_source.votes.clone(),
+        }),
+        ..Header::default()
+    };
+
+    let (_, author_secret) = keys()
+        .into_iter()
+        .find(|(pk, _)| *pk == header.author)
+        .unwrap();
+    header.id = header.digest();
+    header.signature = Signature::new(&header.id, &author_secret);
+    let id = header.id.clone();
+
+    tx_primary_messages
+        .send(PrimaryMessage::Header(header))
+        .await
+        .unwrap();
+
+    assert!(store.read(id.to_vec()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn vote_new_sets_voter_round() {
+    let (_, secret) = keys().pop().unwrap();
+    let mut signature_service = SignatureService::new(secret);
+    let voter = keys().pop().unwrap().0;
+
+    let vote = Vote::new(&header(), 7, &voter, &mut signature_service).await;
+    assert_eq!(vote.round, header().round);
+    assert_eq!(vote.voter_round, 7);
 }
