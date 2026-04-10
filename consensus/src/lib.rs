@@ -95,14 +95,6 @@ pub struct Consensus {
 }
 
 impl Consensus {
-    fn leader_interval() -> Round {
-        ROUNDS_PER_WAVE / 2
-    }
-
-    fn leader_step() -> usize {
-        Self::leader_interval() as usize
-    }
-
     pub fn spawn(
         committee: Committee,
         gc_depth: Round,
@@ -177,61 +169,56 @@ impl Consensus {
                 &coin_cache,
                 &coin_result_tx,
             );
-            //这部分的更新是把硬编码的轮次修改为从配置中读取，为接下来的wave长度更改做准备
-            // Try to order the dag to commit. Start from the highest round for which we have at least
-            // 2f+1 certificates. This is because we need them to reveal the common coin.
-            let wave_end_round = round - 1;
-            let leader_interval = Self::leader_interval();
+            // Try to order the dag to commit using the section-6 rule from DAG构建(1).md:
+            // - trigger only when round r ends and r is a multiple of 4;
+            // - elect leader at round r-3;
+            // - require same-author chain b3 (r-3), b2 (r-2), b1 (r-1);
+            // - require embedded QC links b2->b3 and b1->b2.
+            let commit_round = round;
 
-            // We only elect leaders at wave boundaries.
-            if wave_end_round % leader_interval != 0 || wave_end_round < ROUNDS_PER_WAVE {
+            if commit_round < ROUNDS_PER_WAVE || commit_round % ROUNDS_PER_WAVE != 0 {
                 continue;
             }
 
-            // Get the certificate's digest of the wave leader. If we already ordered this leader,
+            // We only consider a round ended for commit purposes once we have a quorum for that round.
+            if !self.round_has_quorum(commit_round, &state.dag) {
+                continue;
+            }
+
+            // Get the certificate of the wave leader. If we already ordered this leader,
             // there is nothing to do.
-            let leader_round = wave_end_round - leader_interval;
+            let leader_round = commit_round - (ROUNDS_PER_WAVE - 1);
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            let (leader_digest, leader) =
-                match self.leader(leader_round, wave_end_round, &state.dag, &coin_cache)
-            {
+            let (_, leader) = match self.leader(leader_round, commit_round, &state.dag, &coin_cache) {
                 Some(x) => x,
                 None => continue,
             };
 
-            // Check if the leader has f+1 support from its children (ie. round leader_round + 1).
-            let support_round = leader_round + 1;
-            let stake: Stake = state
-                .dag
-                .get(&support_round)
-                .expect("We should have the whole history by now")
-                .values()
-                .filter(|(_, x)| x.header.parents.contains(&leader_digest))
-                .map(|(_, x)| self.committee.stake(&x.origin()))
-                .sum();
+            let b3 = leader.clone();
+            let Some(b2) = self.certificate_by_author(leader_round + 1, b3.origin(), &state.dag) else {
+                continue;
+            };
+            let Some(b1) = self.certificate_by_author(leader_round + 2, b3.origin(), &state.dag) else {
+                continue;
+            };
 
-            // If it is the case, we can commit the leader. But first, we need to recursively go back to
-            // the last committed leader, and commit all preceding leaders in the right order. Committing
-            // a leader block means committing all its dependencies.
-            if stake < self.committee.validity_threshold() {
-                debug!("Leader {:?} does not have enough support", leader);
+            if !self.embedded_qc_links(b2, &b3, commit_round)
+                || !self.embedded_qc_links(b1, b2, commit_round)
+            {
+                debug!("Leader {:?} does not satisfy b3->b2->b1 QC chain", b3);
                 continue;
             }
 
-            // Get an ordered list of past leaders that are linked to the current leader.
-            debug!("Leader {:?} has enough support", leader);
+            debug!("Leader {:?} satisfies section-6 commit rule", b3);
             let mut sequence = Vec::new();
-            for leader in self.order_leaders(leader, &state, &coin_cache).iter().rev() {
-                // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
-                for x in self.order_dag(leader, &state) {
-                    // Update and clean up internal state.
-                    state.update(&x, self.gc_depth);
+            for x in self.order_dag(&b3, &state) {
+                // Update and clean up internal state.
+                state.update(&x, self.gc_depth);
 
-                    // Add the certificate to the sequence.
-                    sequence.push(x);
-                }
+                // Add the certificate to the sequence.
+                sequence.push(x);
             }
 
             // Log the latest committed round of every authority (for debug).
@@ -362,49 +349,38 @@ impl Consensus {
         });
     }
 
-    /// Order the past leaders that we didn't already commit.
-    fn order_leaders(
-        &self,
-        leader: &Certificate,
-        state: &State,
-        coin_cache: &CoinCache,
-    ) -> Vec<Certificate> {
-        let mut to_commit = vec![leader.clone()];
-        let mut leader = leader;
-        let leader_interval = Self::leader_interval();
-        for r in (state.last_committed_round + leader_interval..=leader.round() - leader_interval)
-            .rev()
-            .step_by(Self::leader_step())
-        {
-            // Get the certificate proposed by the previous leader.
-            let coin_round = r + leader_interval;
-            let (_, prev_leader) = match self.leader(r, coin_round, &state.dag, coin_cache) {
-                Some(x) => x,
-                None => continue,
-            };
-
-            // Check whether there is a path between the last two leaders.
-            if self.linked(leader, prev_leader, &state.dag) {
-                to_commit.push(prev_leader.clone());
-                leader = prev_leader;
-            }
-        }
-        to_commit
+    fn round_has_quorum(&self, round: Round, dag: &Dag) -> bool {
+        let Some(certificates) = dag.get(&round) else {
+            return false;
+        };
+        let weight: Stake = certificates
+            .values()
+            .map(|(_, certificate)| self.committee.stake(&certificate.origin()))
+            .sum();
+        weight >= self.committee.quorum_threshold()
     }
 
-    /// Checks if there is a path between two leaders.
-    fn linked(&self, leader: &Certificate, prev_leader: &Certificate, dag: &Dag) -> bool {
-        let mut parents = vec![leader];
-        for r in (prev_leader.round()..leader.round()).rev() {
-            parents = dag
-                .get(&(r))
-                .expect("We should have the whole history by now")
-                .values()
-                .filter(|(digest, _)| parents.iter().any(|x| x.header.parents.contains(digest)))
-                .map(|(_, certificate)| certificate)
-                .collect();
-        }
-        parents.contains(&prev_leader)
+    fn certificate_by_author<'a>(
+        &self,
+        round: Round,
+        author: PublicKey,
+        dag: &'a Dag,
+    ) -> Option<&'a Certificate> {
+        dag.get(&round)
+            .and_then(|by_authority| by_authority.get(&author))
+            .map(|(_, certificate)| certificate)
+    }
+
+    fn embedded_qc_links(
+        &self,
+        child: &Certificate,
+        parent: &Certificate,
+        commit_round: Round,
+    ) -> bool {
+        let Some(qc) = child.header.qc.as_ref() else {
+            return false;
+        };
+        qc.target == parent.header.id && qc.round == parent.round() && qc.round < commit_round
     }
 
     /// Flatten the dag referenced by the input certificate. This is a classic depth-first search (pre-order):
