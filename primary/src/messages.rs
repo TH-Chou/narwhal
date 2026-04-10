@@ -76,6 +76,36 @@ impl Header {
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
+        // Ensure first-hop and second-hop parent sets don't overlap.
+        ensure!(
+            self.parents.is_disjoint(&self.parents_2),
+            DagError::MalformedHeader(self.id.clone())
+        );
+
+        // If present, validate the embedded QC consistency and signatures.
+        if let Some(qc) = &self.qc {
+            ensure!(
+                qc.round < self.round,
+                DagError::MalformedHeader(self.id.clone())
+            );
+
+            let mut weight = 0;
+            let mut used = HashSet::new();
+            for (name, _) in qc.votes.iter() {
+                ensure!(!used.contains(name), DagError::AuthorityReuse(*name));
+                let voting_rights = committee.stake(name);
+                ensure!(voting_rights > 0, DagError::UnknownAuthority(*name));
+                used.insert(*name);
+                weight += voting_rights;
+            }
+            ensure!(
+                weight >= committee.quorum_threshold(),
+                DagError::CertificateRequiresQuorum
+            );
+
+            Signature::verify_batch(&qc.target, &qc.votes).map_err(DagError::from)?;
+        }
+
         // Check the signature.
         self.signature
             .verify(&self.id, &self.author)
@@ -99,8 +129,12 @@ impl Hash for Header {
             hasher.update(x);
         }
         if let Some(qc) = &self.qc {
-            let bytes = bincode::serialize(qc).expect("Failed to serialize embedded QC");
-            hasher.update(bytes);
+            hasher.update(&qc.target);
+            hasher.update(qc.round.to_le_bytes());
+            for (name, signature) in &qc.votes {
+                hasher.update(name);
+                hasher.update(signature);
+            }
         }
         hasher.update(&self.coin_share);
         let digest = hasher.finalize();
