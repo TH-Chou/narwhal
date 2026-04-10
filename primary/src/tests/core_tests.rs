@@ -8,6 +8,7 @@ use crypto::Signature;
 use std::collections::BTreeSet;
 use std::fs;
 use tokio::sync::mpsc::channel;
+use tokio::time::{timeout, Duration};
 
 #[tokio::test]
 async fn process_header() {
@@ -335,12 +336,43 @@ async fn process_certificates() {
         /* tx_proposer */ tx_parents,
     );
 
-    // Send enough certificates to the core.
-    let certificates: Vec<_> = headers()
+    // Send a quorum of certificates that includes our own authority, otherwise
+    // `try_signal_proposer` cannot produce a QC for the next round.
+    let round_1_headers = headers();
+    let own_header = round_1_headers
         .iter()
-        .take(3)
-        .map(|header| certificate(header))
+        .find(|header| header.author == name)
+        .cloned()
+        .unwrap();
+    let mut selected_headers: Vec<_> = vec![own_header.clone()];
+    selected_headers.extend(
+        round_1_headers
+            .iter()
+            .filter(|header| header.author != name)
+            .take(2)
+            .cloned(),
+    );
+    let voter_keys = keys();
+    let certificates: Vec<_> = selected_headers
+        .iter()
+        .map(|header| {
+            let mut certificate = Certificate {
+                header: header.clone(),
+                votes: Vec::new(),
+            };
+            let digest = certificate.digest();
+            certificate.votes = voter_keys
+                .iter()
+                .map(|(voter, secret)| (*voter, Signature::new(&digest, secret)))
+                .collect();
+            certificate
+        })
         .collect();
+    let own_certificate = certificates
+        .iter()
+        .find(|certificate| certificate.origin() == name)
+        .cloned()
+        .unwrap();
 
     for x in certificates.clone() {
         tx_primary_messages
@@ -350,7 +382,10 @@ async fn process_certificates() {
     }
 
     // Ensure the core sends the parents of the certificates to the proposer.
-    let received = rx_parents.recv().await.unwrap();
+    let received = timeout(Duration::from_secs(1), rx_parents.recv())
+        .await
+        .expect("timed out waiting for proposer signal")
+        .unwrap();
     let parents_1 = certificates.iter().map(|x| x.digest()).collect();
     let expected = ProposerSignal {
         round: 2,
@@ -360,9 +395,9 @@ async fn process_certificates() {
             .map(|x| x.digest())
             .collect(),
         qc: Some(crate::messages::EmbeddedQc {
-            target: certificate(&headers()[0]).header.id,
+            target: own_certificate.header.id,
             round: 1,
-            votes: certificate(&headers()[0]).votes,
+            votes: own_certificate.votes,
         }),
     };
     assert_eq!(received.round, expected.round);
@@ -372,7 +407,10 @@ async fn process_certificates() {
 
     // Ensure the core sends the certificates to the consensus.
     for x in certificates.clone() {
-        let received = rx_consensus.recv().await.unwrap();
+        let received = timeout(Duration::from_secs(1), rx_consensus.recv())
+            .await
+            .expect("timed out waiting for consensus certificate")
+            .unwrap();
         assert_eq!(received, x);
     }
 
