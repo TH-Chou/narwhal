@@ -9,7 +9,6 @@ from matplotlib.lines import Line2D
 csv_path = 'results/my_runs.csv'
 out_png = 'results/my_runs_same_x_consensus_latency_box_rr012345_cc543210.png'
 out_svg = 'results/my_runs_same_x_consensus_latency_box_rr012345_cc543210.svg'
-max_latency_ms = 3000.0
 
 rows = []
 with open(csv_path, newline='') as f:
@@ -19,15 +18,6 @@ with open(csv_path, newline='') as f:
             'protocol': r['protocol'],
             'val': float(r['consensus_latency_ms']),
         })
-
-original_count = len(rows)
-rows = [r for r in rows if r['val'] <= max_latency_ms]
-filtered_count = original_count - len(rows)
-if filtered_count > 0:
-    print(
-        f'filtered {filtered_count}/{original_count} latency points '
-        f'(> {max_latency_ms:.0f} ms)'
-    )
 
 faults_rr = [0, 1, 2, 3, 4, 5]
 faults_cc = [0, 1, 2, 3, 4, 5]
@@ -44,7 +34,7 @@ bp_rr = ax.boxplot(
     widths=0.55,
     patch_artist=True,
     showmeans=True,
-    showfliers=False,
+    showfliers=True,
 )
 for b in bp_rr['boxes']:
     b.set_facecolor('none'); b.set_edgecolor('#1f77b4'); b.set_linewidth(2.0)
@@ -57,7 +47,7 @@ bp_cc = ax.boxplot(
     widths=0.30,
     patch_artist=True,
     showmeans=True,
-    showfliers=False,
+    showfliers=True,
 )
 for b in bp_cc['boxes']:
     b.set_facecolor('#ff7f0e'); b.set_alpha(0.35); b.set_edgecolor('#ff7f0e'); b.set_linewidth(1.8)

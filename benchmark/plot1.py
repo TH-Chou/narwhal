@@ -34,7 +34,7 @@ bp_rr = ax.boxplot(
     widths=0.55,
     patch_artist=True,
     showmeans=True,
-    showfliers=False,
+    showfliers=True,
 )
 for b in bp_rr['boxes']:
     b.set_facecolor('none'); b.set_edgecolor('#1f77b4'); b.set_linewidth(2.0)
@@ -47,7 +47,7 @@ bp_cc = ax.boxplot(
     widths=0.30,
     patch_artist=True,
     showmeans=True,
-    showfliers=False,
+    showfliers=True,
 )
 for b in bp_cc['boxes']:
     b.set_facecolor('#ff7f0e'); b.set_alpha(0.35); b.set_edgecolor('#ff7f0e'); b.set_linewidth(1.8)

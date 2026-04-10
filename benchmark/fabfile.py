@@ -92,7 +92,7 @@ def compare_consensus_groups(
     ctx,
     duration=60,
     debug=True,
-    rate=50_000,
+    rate=120_000,
     rounds=10,
     output_csv='results/consensus_fault_comparison_avg.csv',
     output_runs_csv='results/consensus_fault_comparison_runs.csv',
@@ -230,6 +230,267 @@ def compare_consensus_groups(
 
     except BenchError as e:
         Print.error(e)
+
+
+@task
+def compare_consensus_rates_zero_fault(
+    ctx,
+    duration=30,
+    debug=True,
+    rounds=2,
+    nodes=16,
+    rate_start=30_000,
+    rate_step=30_000,
+    rate_end=240_000,
+    output_csv='results/consensus_rate_comparison_avg.csv',
+    output_runs_csv='results/consensus_rate_comparison_runs.csv',
+):
+    ''' Compare consensus TPS vs injection rate at faults=0 for round_robin and common_coin '''
+    node_params = {
+        'header_size': 1_000,  # bytes
+        'max_header_delay': 200,  # ms
+        'gc_depth': 50,  # rounds
+        'sync_retry_delay': 10_000,  # ms
+        'sync_retry_nodes': 3,  # number of nodes
+        'batch_size': 500_000,  # bytes
+        'max_batch_delay': 200,  # ms
+    }
+
+    rounds = int(rounds)
+    nodes = int(nodes)
+    rate_start = int(rate_start)
+    rate_step = int(rate_step)
+    rate_end = int(rate_end)
+    if rounds <= 0:
+        raise BenchError('rounds must be greater than 0')
+    if nodes <= 0:
+        raise BenchError('nodes must be greater than 0')
+    if rate_start < 0 or rate_step <= 0 or rate_end < rate_start:
+        raise BenchError('rate range is invalid')
+
+    protocols = ['round_robin', 'common_coin']
+    rates = list(range(rate_start, rate_end + 1, rate_step))
+    results = {protocol: {} for protocol in protocols}
+    runs_rows = []
+
+    try:
+        for rate in rates:
+            bench_params = {
+                'faults': 0,
+                'nodes': nodes,
+                'workers': 1,
+                'rate': rate,
+                'tx_size': 512,
+                'duration': int(duration),
+            }
+
+            for protocol in protocols:
+                metrics_runs = []
+                for run in range(rounds):
+                    Print.heading(
+                        f'Run {run + 1}/{rounds} | nodes={nodes} faults=0 '
+                        f'protocol={protocol} rate={rate} duration={bench_params["duration"]}s'
+                    )
+                    current = dict(node_params)
+                    current['consensus_protocol'] = protocol
+                    parser = LocalBench(bench_params, current).run(debug)
+                    print(parser.result())
+
+                    metrics = parser.metrics()
+                    metrics_runs.append(metrics)
+                    runs_rows.append(
+                        [
+                            run + 1,
+                            rate,
+                            protocol,
+                            f'{metrics["consensus_tps"]:.6f}',
+                            f'{metrics["consensus_latency_ms"]:.6f}',
+                            f'{metrics["end_to_end_tps"]:.6f}',
+                            f'{metrics["end_to_end_latency_ms"]:.6f}',
+                        ]
+                    )
+
+                results[protocol][rate] = {
+                    'consensus_protocol': protocol,
+                    'consensus_tps': sum(
+                        x['consensus_tps'] for x in metrics_runs
+                    ) / rounds,
+                    'consensus_latency_ms': sum(
+                        x['consensus_latency_ms'] for x in metrics_runs
+                    ) / rounds,
+                    'end_to_end_tps': sum(
+                        x['end_to_end_tps'] for x in metrics_runs
+                    ) / rounds,
+                    'end_to_end_latency_ms': sum(
+                        x['end_to_end_latency_ms'] for x in metrics_runs
+                    ) / rounds,
+                }
+
+        Print.heading(
+            f'Consensus rate sweep at faults=0 (nodes={nodes}, averaged over {rounds} runs)'
+        )
+        print('------------------------------------------------------------')
+        for rate in rates:
+            for protocol in protocols:
+                metrics = results[protocol][rate]
+                print(
+                    f'rate={rate:,}, protocol={protocol}: '
+                    f'consensus_tps={round(metrics["consensus_tps"]):,} tx/s, '
+                    f'consensus_latency={round(metrics["consensus_latency_ms"]):,} ms, '
+                    f'end_to_end_tps={round(metrics["end_to_end_tps"]):,} tx/s, '
+                    f'end_to_end_latency={round(metrics["end_to_end_latency_ms"]):,} ms'
+                )
+        print('------------------------------------------------------------')
+
+        with open(output_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    'rate',
+                    'protocol',
+                    'consensus_tps',
+                    'consensus_latency_ms',
+                    'end_to_end_tps',
+                    'end_to_end_latency_ms',
+                    'rounds',
+                ]
+            )
+            for rate in rates:
+                for protocol in protocols:
+                    metrics = results[protocol][rate]
+                    writer.writerow(
+                        [
+                            rate,
+                            protocol,
+                            f'{metrics["consensus_tps"]:.6f}',
+                            f'{metrics["consensus_latency_ms"]:.6f}',
+                            f'{metrics["end_to_end_tps"]:.6f}',
+                            f'{metrics["end_to_end_latency_ms"]:.6f}',
+                            rounds,
+                        ]
+                    )
+        print(f'Averaged metrics exported to {output_csv}')
+
+        with open(output_runs_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    'run',
+                    'rate',
+                    'protocol',
+                    'consensus_tps',
+                    'consensus_latency_ms',
+                    'end_to_end_tps',
+                    'end_to_end_latency_ms',
+                ]
+            )
+            writer.writerows(runs_rows)
+        print(f'Per-run metrics exported to {output_runs_csv}')
+
+    except BenchError as e:
+        Print.error(e)
+
+
+@task
+def plot_consensus_rates_zero_fault(
+    ctx,
+    csv_path='results/consensus_rate_comparison_avg.csv',
+    out_png='results/consensus_tps_vs_rate_zero_fault_with_table.png',
+    out_svg='results/consensus_tps_vs_rate_zero_fault_with_table.svg',
+    out_latency_png='results/consensus_latency_vs_rate_zero_fault_with_table.png',
+    out_latency_svg='results/consensus_latency_vs_rate_zero_fault_with_table.svg',
+):
+    ''' Plot consensus TPS and latency vs rate at faults=0 with summary tables above charts '''
+    import matplotlib.pyplot as plt
+
+    rows = []
+    with open(csv_path, newline='') as f:
+        for row in csv.DictReader(f):
+            rows.append(
+                {
+                    'rate': int(row['rate']),
+                    'protocol': row['protocol'],
+                    'consensus_tps': float(row['consensus_tps']),
+                    'consensus_latency_ms': float(row['consensus_latency_ms']),
+                }
+            )
+
+    rates = sorted({x['rate'] for x in rows})
+    protocols = ['round_robin', 'common_coin']
+    colors = {'round_robin': '#1f77b4', 'common_coin': '#ff7f0e'}
+
+    by_protocol_rate = {
+        protocol: {x['rate']: x for x in rows if x['protocol'] == protocol}
+        for protocol in protocols
+    }
+
+    def _plot_with_table(metric_key, title, y_label, col_labels, out_file_png, out_file_svg):
+        fig = plt.figure(figsize=(12, 8))
+        gs = fig.add_gridspec(2, 1, height_ratios=[1.15, 3.0])
+        ax_table = fig.add_subplot(gs[0])
+        ax_plot = fig.add_subplot(gs[1])
+
+        for protocol in protocols:
+            ys = [by_protocol_rate[protocol][rate][metric_key] for rate in rates]
+            ax_plot.plot(
+                rates,
+                ys,
+                marker='o',
+                linewidth=2.5,
+                markersize=6,
+                label=protocol,
+                color=colors[protocol],
+            )
+
+        ax_plot.set_title(title)
+        ax_plot.set_xlabel('Injection Rate (tx/s)')
+        ax_plot.set_ylabel(y_label)
+        ax_plot.set_xticks(rates)
+        ax_plot.grid(axis='y', alpha=0.25)
+        ax_plot.legend()
+
+        ax_table.axis('off')
+        table_rows = [
+            [
+                f'{rate:,}',
+                f'{by_protocol_rate["round_robin"][rate][metric_key]:,.0f}',
+                f'{by_protocol_rate["common_coin"][rate][metric_key]:,.0f}',
+            ]
+            for rate in rates
+        ]
+        table = ax_table.table(
+            cellText=table_rows,
+            colLabels=col_labels,
+            cellLoc='center',
+            loc='center',
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.0, 1.2)
+
+        fig.tight_layout()
+        fig.savefig(out_file_png, dpi=180)
+        fig.savefig(out_file_svg)
+        plt.close(fig)
+        print(f'Plot exported to {out_file_png} and {out_file_svg}')
+
+    _plot_with_table(
+        'consensus_tps',
+        'Consensus TPS vs Injection Rate (faults=0)',
+        'Consensus TPS (tx/s)',
+        ['Rate (tx/s)', 'round_robin TPS', 'common_coin TPS'],
+        out_png,
+        out_svg,
+    )
+
+    _plot_with_table(
+        'consensus_latency_ms',
+        'Consensus Latency vs Injection Rate (faults=0)',
+        'Consensus Latency (ms)',
+        ['Rate (tx/s)', 'round_robin Latency', 'common_coin Latency'],
+        out_latency_png,
+        out_latency_svg,
+    )
 
 
 @task
