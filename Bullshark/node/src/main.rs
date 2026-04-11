@@ -105,10 +105,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
-            Consensus::spawn_with_protocol(
+            Consensus::spawn(
                 committee,
                 parameters.gc_depth,
-                parameters.consensus_protocol,
                 /* rx_primary */ rx_new_certificates,
                 /* tx_primary */ tx_feedback,
                 tx_output,

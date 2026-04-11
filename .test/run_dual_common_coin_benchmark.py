@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+import csv
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+def find_project_dirs(root: Path):
+    def is_valid_project(path: Path) -> bool:
+        return (
+            path.exists()
+            and (path / "Cargo.toml").exists()
+            and (path / "benchmark" / "benchmark" / "local.py").exists()
+            and (path / "primary" / "src" / "lib.rs").exists()
+        )
+
+    preferred_names = ["NovelDAG", "Narwhal", "narwhal"]
+    found = []
+    for name in preferred_names:
+        path = root / name
+        if is_valid_project(path):
+            found.append((name, path))
+
+    # Keep exactly two projects in order of preference.
+    if len(found) >= 2:
+        return found[:2]
+    return found
+
+
+def run_one(benchmark_dir: Path, nodes: int, faults: int, rate: int, duration: int):
+    inline = r'''
+import json
+import re
+from benchmark.local import LocalBench
+bench = {
+    "faults": __FAULTS__,
+    "nodes": __NODES__,
+    "workers": 1,
+    "rate": __RATE__,
+    "tx_size": 512,
+    "duration": __DURATION__,
+}
+node = {
+    "header_size": 1000,
+    "max_header_delay": 200,
+    "gc_depth": 50,
+    "sync_retry_delay": 10000,
+    "sync_retry_nodes": 3,
+    "batch_size": 500000,
+    "max_batch_delay": 200,
+    "consensus_protocol": "common_coin",
+}
+parser = LocalBench(bench, node).run(False)
+if hasattr(parser, "metrics") and callable(parser.metrics):
+    metrics = parser.metrics()
+else:
+    text = parser.result()
+    def pick(label):
+        m = re.search(rf"{label}:\s*([0-9,\.]+)", text)
+        if not m:
+            raise RuntimeError(f"cannot parse '{label}' from benchmark output")
+        return float(m.group(1).replace(",", ""))
+    metrics = {
+        "consensus_protocol": "common_coin",
+        "consensus_tps": pick("Consensus TPS"),
+        "consensus_latency_ms": pick("Consensus latency"),
+        "end_to_end_tps": pick("End-to-end TPS"),
+        "end_to_end_latency_ms": pick("End-to-end latency"),
+    }
+print("METRICS_JSON=" + json.dumps(metrics, ensure_ascii=False))
+'''.replace("__FAULTS__", str(faults)).replace("__NODES__", str(nodes)).replace("__RATE__", str(rate)).replace("__DURATION__", str(duration))
+
+    proc = subprocess.run(
+        ["python3", "-c", inline],
+        cwd=str(benchmark_dir),
+        text=True,
+        capture_output=True,
+    )
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Benchmark failed in {benchmark_dir}\n"
+            f"exit={proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+
+    marker = "METRICS_JSON="
+    metrics_line = None
+    for line in stdout.splitlines()[::-1]:
+        if line.startswith(marker):
+            metrics_line = line[len(marker):]
+            break
+    if metrics_line is None:
+        raise RuntimeError(
+            f"Could not parse metrics output in {benchmark_dir}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+
+    metrics = json.loads(metrics_line)
+    return metrics, stdout
+
+
+def aggregate(rows):
+    grouped = {}
+    for r in rows:
+        key = (r["project"], r["faults"], r["rate"])
+        grouped.setdefault(key, []).append(r)
+
+    out = []
+    for (project, faults, rate), items in sorted(grouped.items()):
+        n = len(items)
+        out.append(
+            {
+                "project": project,
+                "faults": faults,
+                "rate": rate,
+                "consensus_tps": sum(x["consensus_tps"] for x in items) / n,
+                "consensus_latency_ms": sum(x["consensus_latency_ms"] for x in items) / n,
+                "end_to_end_tps": sum(x["end_to_end_tps"] for x in items) / n,
+                "end_to_end_latency_ms": sum(x["end_to_end_latency_ms"] for x in items) / n,
+                "runs": n,
+            }
+        )
+    return out
+
+
+def write_csv(path: Path, rows, fieldnames):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_csv_row(path: Path, row, fieldnames):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def load_existing_runs(path: Path):
+    if not path.exists():
+        return []
+
+    rows = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        for raw in csv.DictReader(f):
+            rows.append(
+                {
+                    "project": raw["project"],
+                    "nodes": int(raw["nodes"]),
+                    "faults": int(raw["faults"]),
+                    "rate": int(raw["rate"]),
+                    "duration": int(raw["duration"]),
+                    "run": int(raw["run"]),
+                    "consensus_protocol": raw.get("consensus_protocol", "common_coin"),
+                    "consensus_tps": float(raw["consensus_tps"]),
+                    "consensus_latency_ms": float(raw["consensus_latency_ms"]),
+                    "end_to_end_tps": float(raw["end_to_end_tps"]),
+                    "end_to_end_latency_ms": float(raw["end_to_end_latency_ms"]),
+                }
+            )
+    return rows
+
+
+def make_plots(avg_rows, out_dir: Path):
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print(
+            "[WARN] matplotlib is not installed; skipping plot generation for now.",
+            flush=True,
+        )
+        return False
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Plot 1: Injection rate (x) vs consensus TPS (y)
+    plt.figure(figsize=(10, 6))
+    styles = {
+        ("NovelDAG", 0): ("-o", "NovelDAG f=0"),
+        ("NovelDAG", 5): ("--o", "NovelDAG f=5"),
+        ("Narwhal", 0): ("-s", "Tusk f=0"),
+        ("Narwhal", 5): ("--s", "Tusk f=5"),
+        ("narwhal", 0): ("-s", "narwhal f=0"),
+        ("narwhal", 5): ("--s", "narwhal f=5"),
+    }
+
+    series = {}
+    for r in avg_rows:
+        key = (r["project"], r["faults"])
+        series.setdefault(key, []).append(r)
+
+    for key, points in sorted(series.items()):
+        points = sorted(points, key=lambda x: x["rate"])
+        x = [p["rate"] for p in points]
+        y = [p["consensus_tps"] for p in points]
+        style, label = styles.get(key, ("-^", f"{key[0]} f={key[1]}"))
+        plt.plot(x, y, style, label=label)
+
+    plt.xlabel("Injection Rate (tx/s)")
+    plt.ylabel("Consensus TPS (tx/s)")
+    plt.title("Common Coin: Injection Rate vs Consensus TPS")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "rate_vs_tps_common_coin.png", dpi=180)
+    plt.close()
+
+    # Plot 2: Consensus TPS (x) vs consensus latency (y)
+    # Connect points by increasing injection rate to reflect load ramp.
+    plt.figure(figsize=(10, 6))
+    for key, points in sorted(series.items()):
+        points = sorted(points, key=lambda x: x["rate"])
+        x = [p["consensus_tps"] for p in points]
+        y = [p["consensus_latency_ms"] for p in points]
+        style, label = styles.get(key, ("-^", f"{key[0]} f={key[1]}"))
+        plt.plot(x, y, style, label=label)
+
+    plt.xlabel("Consensus TPS (tx/s)")
+    plt.ylabel("Consensus Latency (ms)")
+    plt.title("Common Coin: Consensus TPS vs Latency")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "tps_vs_latency_common_coin.png", dpi=180)
+    plt.close()
+
+    return True
+
+
+def main():
+    script_root = Path(__file__).resolve().parent
+    repo_root = script_root.parent
+    projects = find_project_dirs(repo_root)
+    if len(projects) < 2:
+        print("Need at least two project folders (e.g., NovelDAG and Narwhal/narwhal)", file=sys.stderr)
+        sys.exit(1)
+
+    print("Projects:")
+    for name, path in projects:
+        print(f"- {name}: {path}")
+
+    rates = list(range(20000, 160001, 20000))
+    faults_list = [0, 5]
+    rounds = 3
+    duration = 30
+    nodes = 16
+
+    out_dir = script_root / "comparison_results" / "common_coin_n16_f0_f5"
+    runs_csv_path = out_dir / "runs.csv"
+    avg_csv_path = out_dir / "average.csv"
+
+    runs_fieldnames = [
+        "project",
+        "nodes",
+        "faults",
+        "rate",
+        "duration",
+        "run",
+        "consensus_protocol",
+        "consensus_tps",
+        "consensus_latency_ms",
+        "end_to_end_tps",
+        "end_to_end_latency_ms",
+    ]
+    avg_fieldnames = [
+        "project",
+        "faults",
+        "rate",
+        "consensus_tps",
+        "consensus_latency_ms",
+        "end_to_end_tps",
+        "end_to_end_latency_ms",
+        "runs",
+    ]
+
+    rows = load_existing_runs(runs_csv_path)
+    completed = {
+        (r["project"], r["faults"], r["rate"], r["run"])
+        for r in rows
+    }
+
+    if completed:
+        print(f"Resuming from existing runs: {len(completed)} completed entries found.")
+
+    plot_enabled = True
+
+    for project_name, project_path in projects:
+        bench_dir = project_path / "benchmark"
+        for faults in faults_list:
+            for rate in rates:
+                for run_idx in range(1, rounds + 1):
+                    run_key = (project_name, faults, rate, run_idx)
+                    if run_key in completed:
+                        print(
+                            f"[SKIP] project={project_name} nodes={nodes} faults={faults} "
+                            f"rate={rate} duration={duration}s run={run_idx}/{rounds} (already persisted)",
+                            flush=True,
+                        )
+                        continue
+
+                    print(
+                        f"[RUN] project={project_name} nodes={nodes} faults={faults} "
+                        f"rate={rate} duration={duration}s run={run_idx}/{rounds}",
+                        flush=True,
+                    )
+                    metrics, stdout = run_one(bench_dir, nodes, faults, rate, duration)
+                    row = {
+                        "project": project_name,
+                        "nodes": nodes,
+                        "faults": faults,
+                        "rate": rate,
+                        "duration": duration,
+                        "run": run_idx,
+                        "consensus_protocol": metrics.get("consensus_protocol", "common_coin"),
+                        "consensus_tps": metrics["consensus_tps"],
+                        "consensus_latency_ms": metrics["consensus_latency_ms"],
+                        "end_to_end_tps": metrics["end_to_end_tps"],
+                        "end_to_end_latency_ms": metrics["end_to_end_latency_ms"],
+                    }
+                    rows.append(row)
+                    completed.add(run_key)
+
+                    append_csv_row(runs_csv_path, row, runs_fieldnames)
+                    avg_rows = aggregate(rows)
+                    write_csv(avg_csv_path, avg_rows, avg_fieldnames)
+                    if plot_enabled:
+                        plot_enabled = make_plots(avg_rows, out_dir)
+
+                    print(
+                        f"[FLUSHED] runs={len(rows)} latest={project_name} f={faults} rate={rate} run={run_idx}",
+                        flush=True,
+                    )
+
+    avg_rows = aggregate(rows)
+
+    write_csv(runs_csv_path, rows, runs_fieldnames)
+    write_csv(avg_csv_path, avg_rows, avg_fieldnames)
+
+    if plot_enabled:
+        make_plots(avg_rows, out_dir)
+    else:
+        print("[INFO] Plots were skipped because matplotlib is unavailable.")
+
+    print("\nDone.")
+    print(f"CSV: {out_dir / 'runs.csv'}")
+    print(f"CSV: {out_dir / 'average.csv'}")
+    print(f"Plot: {out_dir / 'rate_vs_tps_common_coin.png'}")
+    print(f"Plot: {out_dir / 'tps_vs_latency_common_coin.png'}")
+
+
+if __name__ == "__main__":
+    main()

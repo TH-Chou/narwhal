@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use config::{Committee, ConsensusProtocol, Stake};
+use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
@@ -67,8 +67,6 @@ pub struct Consensus {
     committee: Committee,
     /// The depth of the garbage collector.
     gc_depth: Round,
-    /// The consensus leader election mode.
-    consensus_protocol: ConsensusProtocol,
 
     /// Receives new certificates from the primary. The primary should send us new certificates only
     /// if it already sent us its whole history.
@@ -90,29 +88,10 @@ impl Consensus {
         tx_primary: Sender<Certificate>,
         tx_output: Sender<Certificate>,
     ) {
-        Self::spawn_with_protocol(
-            committee,
-            gc_depth,
-            ConsensusProtocol::RoundRobin,
-            rx_primary,
-            tx_primary,
-            tx_output,
-        );
-    }
-
-    pub fn spawn_with_protocol(
-        committee: Committee,
-        gc_depth: Round,
-        consensus_protocol: ConsensusProtocol,
-        rx_primary: Receiver<Certificate>,
-        tx_primary: Sender<Certificate>,
-        tx_output: Sender<Certificate>,
-    ) {
         tokio::spawn(async move {
             Self {
                 committee: committee.clone(),
                 gc_depth,
-                consensus_protocol,
                 rx_primary,
                 tx_primary,
                 tx_output,
@@ -139,23 +118,20 @@ impl Consensus {
                 .or_insert_with(HashMap::new)
                 .insert(certificate.origin(), (certificate.digest(), certificate));
 
-            // Try to order the dag to commit. Start from the highest round for which we have at least
-            // 2f+1 certificates. This is because we need them to reveal the common coin.
+            // Try to order the dag to commit. Start from the previous round and check if it is a leader round.
             let r = round - 1;
 
             // We only elect leaders for even round numbers.
-            if r % 2 != 0 || r < 4 {
+            if r % 2 != 0 || r < 2 {
                 continue;
             }
 
-            // Get the certificate's digest of the leader of round r-2. If we already ordered this leader,
-            // there is nothing to do.
-            let leader_round = r - 2;
-            let coin_round = r;
+            // Get the certificate's digest of the leader. If we already ordered this leader, there is nothing to do.
+            let leader_round = r;
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            let (leader_digest, leader) = match self.leader(leader_round, coin_round, &state.dag) {
+            let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
                 Some(x) => x,
                 None => continue,
             };
@@ -163,10 +139,10 @@ impl Consensus {
             // Check if the leader has f+1 support from its children (ie. round r-1).
             let stake: Stake = state
                 .dag
-                .get(&(r - 1))
+                .get(&round)
                 .expect("We should have the whole history by now")
                 .values()
-                .filter(|(_, x)| x.header.parents.contains(&leader_digest))
+                .filter(|(_, x)| x.header.parents.contains(leader_digest))
                 .map(|(_, x)| self.committee.stake(&x.origin()))
                 .sum();
 
@@ -224,75 +200,20 @@ impl Consensus {
 
     /// Returns the certificate (and the certificate's digest) originated by the leader of the
     /// specified round (if any).
-    fn leader<'a>(
-        &self,
-        round: Round,
-        coin_round: Round,
-        dag: &'a Dag,
-    ) -> Option<&'a (Digest, Certificate)> {
-        let by_round = dag.get(&round)?;
-
-        let leader = match self.consensus_protocol {
-            ConsensusProtocol::RoundRobin => self.round_robin_leader(round),
-            ConsensusProtocol::CommonCoin => {
-                let coin = self
-                    .common_coin(coin_round, dag)
-                    .unwrap_or_else(|| self.round_robin_coin(round));
-                let mut keys: Vec<_> = by_round.keys().cloned().collect();
-                if keys.is_empty() {
-                    return None;
-                }
-                keys.sort();
-                keys[coin as usize % keys.len()]
-            }
-        };
-
-        by_round.get(&leader)
-    }
-
-    fn round_robin_coin(&self, round: Round) -> Round {
+    fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
+        // TODO: We should elect the leader of round r-2 using the common coin revealed at round r.
+        // At this stage, we are guaranteed to have 2f+1 certificates from round r (which is enough to
+        // compute the coin). We currently just use round-robin.
         #[cfg(test)]
-        {
-            let _ = round;
-            0
-        }
+        let seed = 0;
         #[cfg(not(test))]
-        {
-            round
-        }
-    }
+        let seed = round;
 
-    fn round_robin_leader(&self, round: Round) -> PublicKey {
-        let coin = self.round_robin_coin(round);
-        let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
-        keys.sort();
-        keys[coin as usize % self.committee.size()]
-    }
+        // Elect the leader.
+        let leader = self.committee.leader(seed as usize);
 
-    fn common_coin(&self, round: Round, dag: &Dag) -> Option<Round> {
-        let certificates = dag.get(&round)?;
-        let weight: Stake = certificates
-            .values()
-            .map(|(_, certificate)| self.committee.stake(&certificate.origin()))
-            .sum();
-        if weight < self.committee.quorum_threshold() {
-            return None;
-        }
-
-        let mut digests: Vec<_> = certificates
-            .values()
-            .map(|(digest, _)| digest.clone())
-            .collect();
-        digests.sort();
-
-        let mut seed = round;
-        for digest in digests {
-            let mut chunk = [0u8; 8];
-            chunk.copy_from_slice(&digest.0[..8]);
-            seed ^= u64::from_le_bytes(chunk);
-            seed = seed.rotate_left(13).wrapping_mul(0x9E37_79B1_85EB_CA87);
-        }
-        Some(seed)
+        // Return its certificate and the certificate's digest.
+        dag.get(&round).map(|x| x.get(&leader)).flatten()
     }
 
     /// Order the past leaders that we didn't already commit.
@@ -304,7 +225,7 @@ impl Consensus {
             .step_by(2)
         {
             // Get the certificate proposed by the previous leader.
-            let (_, prev_leader) = match self.leader(r, r + 2, &state.dag) {
+            let (_, prev_leader) = match self.leader(r, &state.dag) {
                 Some(x) => x,
                 None => continue,
             };
