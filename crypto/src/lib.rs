@@ -336,5 +336,9 @@ pub fn recover_coin(
         return None;
     }
     let bytes = signature.to_bytes();
-    Some(u64::from_le_bytes(bytes[..8].try_into().ok()?))
+    let mut hasher = Sha512::new();
+    hasher.update(b"narwhal-common-coin-output-v1");
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    Some(u64::from_le_bytes(digest[..8].try_into().ok()?))
 }

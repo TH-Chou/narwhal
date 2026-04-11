@@ -284,7 +284,9 @@ impl Core {
                     DagError::MalformedHeader(header.id.clone())
                 );
                 ensure!(
-                    header.parents.contains(&qc.target),
+                    parents_1
+                        .iter()
+                        .any(|certificate| certificate.header.id == qc.target),
                     DagError::MalformedHeader(header.id.clone())
                 );
             }

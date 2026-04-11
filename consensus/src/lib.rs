@@ -191,6 +191,22 @@ impl Consensus {
             if leader_round <= state.last_committed_round {
                 continue;
             }
+
+            if matches!(self.consensus_protocol, ConsensusProtocol::CommonCoin)
+                && !coin_cache.contains_key(&commit_round)
+            {
+                if let Some(input) = self.common_coin_input(commit_round, &state.dag) {
+                    if let Some(coin) = recover_coin(
+                        &input.authorities,
+                        input.threshold,
+                        input.round,
+                        &input.shares,
+                    ) {
+                        coin_cache.insert(commit_round, coin);
+                    }
+                }
+            }
+
             let (_, leader) = match self.leader(leader_round, commit_round, &state.dag, &coin_cache) {
                 Some(x) => x,
                 None => continue,
@@ -260,30 +276,40 @@ impl Consensus {
         dag: &'a Dag,
         coin_cache: &CoinCache,
     ) -> Option<&'a (Digest, Certificate)> {
+        let by_round = dag.get(&round)?;
+
         // We elect the leader of round r-2 using either:
         // - round-robin (deterministic fallback), or
         // - a reproducible common-coin value derived from round-r certificates.
-        let coin = match self.consensus_protocol {
+        let leader = match self.consensus_protocol {
             ConsensusProtocol::RoundRobin => {
-                #[cfg(test)]
-                {
-                    0
-                }
-                #[cfg(not(test))]
-                {
-                    round
-                }
+                let coin = {
+                    #[cfg(test)]
+                    {
+                        0
+                    }
+                    #[cfg(not(test))]
+                    {
+                        round
+                    }
+                };
+                let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
+                keys.sort();
+                keys[coin as usize % self.committee.size()]
             }
-            ConsensusProtocol::CommonCoin => *coin_cache.get(&coin_round)?,
+            ConsensusProtocol::CommonCoin => {
+                let coin = *coin_cache.get(&coin_round)?;
+                let mut keys: Vec<_> = by_round.keys().cloned().collect();
+                if keys.is_empty() {
+                    return None;
+                }
+                keys.sort();
+                keys[coin as usize % keys.len()]
+            }
         };
 
-        // Elect the leader.
-        let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
-        keys.sort();
-        let leader = keys[coin as usize % self.committee.size()];
-
         // Return its certificate and the certificate's digest.
-        dag.get(&round).map(|x| x.get(&leader)).flatten()
+        by_round.get(&leader)
     }
 
     fn common_coin_input(&self, round: Round, dag: &Dag) -> Option<CoinComputationInput> {
