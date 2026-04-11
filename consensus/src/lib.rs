@@ -380,7 +380,10 @@ impl Consensus {
         let Some(qc) = child.header.qc.as_ref() else {
             return false;
         };
-        qc.target == parent.header.id && qc.round == parent.round() && qc.round < commit_round
+        qc.target == parent.header.id
+            && qc.round == parent.round()
+            && qc.round < commit_round
+            && qc.votes.iter().all(|vote| vote.voter_round < commit_round)
     }
 
     /// Flatten the dag referenced by the input certificate. This is a classic depth-first search (pre-order):

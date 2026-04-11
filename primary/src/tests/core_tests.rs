@@ -352,20 +352,13 @@ async fn process_certificates() {
             .take(2)
             .cloned(),
     );
-    let voter_keys = keys();
     let certificates: Vec<_> = selected_headers
         .iter()
         .map(|header| {
-            let mut certificate = Certificate {
+            Certificate {
                 header: header.clone(),
-                votes: Vec::new(),
-            };
-            let digest = certificate.digest();
-            certificate.votes = voter_keys
-                .iter()
-                .map(|(voter, secret)| (*voter, Signature::new(&digest, secret)))
-                .collect();
-            certificate
+                votes: votes(header),
+            }
         })
         .collect();
     let own_certificate = certificates

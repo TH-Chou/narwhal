@@ -14,7 +14,7 @@ use std::fmt;
 pub struct EmbeddedQc {
     pub target: Digest,
     pub round: Round,
-    pub votes: Vec<(PublicKey, Signature)>,
+    pub votes: Vec<Vote>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -108,19 +108,20 @@ impl Header {
 
             let mut weight = 0;
             let mut used = HashSet::new();
-            for (name, _) in qc.votes.iter() {
-                ensure!(!used.contains(name), DagError::AuthorityReuse(*name));
-                let voting_rights = committee.stake(name);
-                ensure!(voting_rights > 0, DagError::UnknownAuthority(*name));
-                used.insert(*name);
-                weight += voting_rights;
+            for vote in qc.votes.iter() {
+                ensure!(vote.id == qc.target, DagError::MalformedHeader(self.id.clone()));
+                ensure!(vote.round == qc.round, DagError::MalformedHeader(self.id.clone()));
+                ensure!(vote.origin == self.author, DagError::MalformedHeader(self.id.clone()));
+
+                ensure!(!used.contains(&vote.author), DagError::AuthorityReuse(vote.author));
+                vote.verify(committee)?;
+                used.insert(vote.author);
+                weight += committee.stake(&vote.author);
             }
             ensure!(
                 weight >= committee.quorum_threshold(),
                 DagError::CertificateRequiresQuorum
             );
-
-            Signature::verify_batch(&qc.target, &qc.votes).map_err(DagError::from)?;
         }
 
         // Check the signature.
@@ -148,9 +149,13 @@ impl Hash for Header {
         if let Some(qc) = &self.qc {
             hasher.update(&qc.target);
             hasher.update(qc.round.to_le_bytes());
-            for (name, signature) in &qc.votes {
-                hasher.update(name);
-                hasher.update(signature.to_bytes());
+            for vote in &qc.votes {
+                hasher.update(&vote.id);
+                hasher.update(vote.round.to_le_bytes());
+                hasher.update(vote.voter_round.to_le_bytes());
+                hasher.update(&vote.origin);
+                hasher.update(&vote.author);
+                hasher.update(vote.signature.to_bytes());
             }
         }
         hasher.update(&self.coin_share);
@@ -250,7 +255,7 @@ impl fmt::Debug for Vote {
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Certificate {
     pub header: Header,
-    pub votes: Vec<(PublicKey, Signature)>,
+    pub votes: Vec<Vote>,
 }
 
 impl Certificate {
@@ -280,20 +285,28 @@ impl Certificate {
         // Ensure the certificate has a quorum.
         let mut weight = 0;
         let mut used = HashSet::new();
-        for (name, _) in self.votes.iter() {
-            ensure!(!used.contains(name), DagError::AuthorityReuse(*name));
-            let voting_rights = committee.stake(name);
-            ensure!(voting_rights > 0, DagError::UnknownAuthority(*name));
-            used.insert(*name);
-            weight += voting_rights;
+        for vote in self.votes.iter() {
+            ensure!(vote.id == self.header.id, DagError::MalformedHeader(self.header.id.clone()));
+            ensure!(vote.round == self.round(), DagError::MalformedHeader(self.header.id.clone()));
+            ensure!(
+                vote.origin == self.origin(),
+                DagError::MalformedHeader(self.header.id.clone())
+            );
+
+            ensure!(
+                !used.contains(&vote.author),
+                DagError::AuthorityReuse(vote.author)
+            );
+            vote.verify(committee)?;
+            used.insert(vote.author);
+            weight += committee.stake(&vote.author);
         }
         ensure!(
             weight >= committee.quorum_threshold(),
             DagError::CertificateRequiresQuorum
         );
 
-        // Check the signatures.
-        Signature::verify_batch(&self.digest(), &self.votes).map_err(DagError::from)
+        Ok(())
     }
 
     pub fn round(&self) -> Round {

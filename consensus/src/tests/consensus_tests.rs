@@ -2,7 +2,7 @@
 use super::*;
 use config::{Authority, PrimaryAddresses};
 use crypto::{generate_keypair, SecretKey};
-use primary::{EmbeddedQc, Header};
+use primary::{EmbeddedQc, Header, Vote};
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -302,4 +302,65 @@ async fn missing_leader() {
         .expect("commit timed out")
         .expect("consensus output closed");
     assert!(committed.round() >= 1);
+}
+
+// At r=4, if the QC embedded in b1 (round 3) contains any vote with voter_round >= 4,
+// the section-6 commit rule must reject committing b3.
+#[tokio::test]
+async fn reject_commit_when_qc_vote_round_not_less_than_commit_round() {
+    let mut keys: Vec<_> = keys().into_iter().map(|(x, _)| x).collect();
+    keys.sort();
+
+    let genesis = Certificate::genesis(&mock_committee())
+        .iter()
+        .map(|x| x.digest())
+        .collect::<BTreeSet<_>>();
+    let (mut certificates, _) = make_certificates(1, 4, &genesis, &keys);
+
+    let leader = keys[0];
+    if let Some(b1) = certificates
+        .iter_mut()
+        .find(|certificate| certificate.round() == 3 && certificate.origin() == leader)
+    {
+        let target = b1
+            .header
+            .qc
+            .as_ref()
+            .map(|qc| qc.target.clone())
+            .unwrap_or_default();
+        b1.header.qc = Some(EmbeddedQc {
+            target,
+            round: 2,
+            votes: vec![Vote {
+                id: Digest::default(),
+                round: 2,
+                voter_round: 4,
+                origin: leader,
+                author: keys[1],
+                signature: Default::default(),
+            }],
+        });
+    }
+
+    let (tx_waiter, rx_waiter) = channel(1);
+    let (tx_primary, mut rx_primary) = channel(1);
+    let (tx_output, mut rx_output) = channel(1);
+    Consensus::spawn(
+        mock_committee(),
+        /* gc_depth */ 50,
+        rx_waiter,
+        tx_primary,
+        tx_output,
+    );
+    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
+
+    while let Some(certificate) = certificates.pop_front() {
+        tx_waiter.send(certificate).await.unwrap();
+    }
+
+    let no_commit = timeout(Duration::from_millis(300), rx_output.recv()).await;
+    assert!(
+        no_commit.is_err(),
+        "unexpected commit when qc vote round is not less than commit round"
+    );
 }
