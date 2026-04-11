@@ -15,20 +15,35 @@ def find_project_dirs(root: Path):
             and (path / "primary" / "src" / "lib.rs").exists()
         )
 
-    preferred_names = ["NovelDAG", "Narwhal", "narwhal"]
+    preferred = [
+        ("NovelDAG", "NovelDAG", "common_coin"),
+        ("Narwhal", "Narwhal", "common_coin"),
+        ("narwhal", "Narwhal", "common_coin"),
+        ("Bullshark", "Bullshark", "round_robin"),
+    ]
     found = []
-    for name in preferred_names:
+    seen_canonical = set()
+    for folder_name, project_name, protocol in preferred:
+        if project_name in seen_canonical:
+            continue
+        name = folder_name
         path = root / name
         if is_valid_project(path):
-            found.append((name, path))
+            found.append((project_name, path, protocol))
+            seen_canonical.add(project_name)
 
-    # Keep exactly two projects in order of preference.
-    if len(found) >= 2:
-        return found[:2]
     return found
 
 
-def run_one(benchmark_dir: Path, nodes: int, faults: int, rate: int, duration: int):
+def run_one(
+    benchmark_dir: Path,
+    nodes: int,
+    faults: int,
+    rate: int,
+    duration: int,
+    node_parameters: dict,
+    protocol_label: str,
+):
     inline = r'''
 import json
 import re
@@ -42,34 +57,24 @@ bench = {
     "duration": __DURATION__,
 }
 node = {
-    "header_size": 1000,
-    "max_header_delay": 200,
-    "gc_depth": 50,
-    "sync_retry_delay": 10000,
-    "sync_retry_nodes": 3,
-    "batch_size": 500000,
-    "max_batch_delay": 200,
-    "consensus_protocol": "common_coin",
+__NODE_PARAMETERS__
 }
 parser = LocalBench(bench, node).run(False)
-if hasattr(parser, "metrics") and callable(parser.metrics):
-    metrics = parser.metrics()
-else:
-    text = parser.result()
-    def pick(label):
-        m = re.search(rf"{label}:\s*([0-9,\.]+)", text)
-        if not m:
-            raise RuntimeError(f"cannot parse '{label}' from benchmark output")
-        return float(m.group(1).replace(",", ""))
-    metrics = {
-        "consensus_protocol": "common_coin",
-        "consensus_tps": pick("Consensus TPS"),
-        "consensus_latency_ms": pick("Consensus latency"),
-        "end_to_end_tps": pick("End-to-end TPS"),
-        "end_to_end_latency_ms": pick("End-to-end latency"),
-    }
+text = parser.result()
+def pick(label):
+    m = re.search(rf"{label}:\s*([0-9,\.]+)", text)
+    if not m:
+        raise RuntimeError(f"cannot parse '{label}' from benchmark output")
+    return float(m.group(1).replace(",", ""))
+metrics = {
+    "consensus_protocol": "__PROTOCOL_LABEL__",
+    "consensus_tps": pick("Consensus TPS"),
+    "consensus_latency_ms": pick("Consensus latency"),
+    "end_to_end_tps": pick("End-to-end TPS"),
+    "end_to_end_latency_ms": pick("End-to-end latency"),
+}
 print("METRICS_JSON=" + json.dumps(metrics, ensure_ascii=False))
-'''.replace("__FAULTS__", str(faults)).replace("__NODES__", str(nodes)).replace("__RATE__", str(rate)).replace("__DURATION__", str(duration))
+'''.replace("__FAULTS__", str(faults)).replace("__NODES__", str(nodes)).replace("__RATE__", str(rate)).replace("__DURATION__", str(duration)).replace("__NODE_PARAMETERS__", json.dumps(node_parameters, ensure_ascii=False)[1:-1]).replace("__PROTOCOL_LABEL__", protocol_label)
 
     proc = subprocess.run(
         ["python3", "-c", inline],
@@ -185,8 +190,14 @@ def make_plots(avg_rows, out_dir: Path):
     styles = {
         ("NovelDAG", 0): ("-o", "NovelDAG f=0"),
         ("NovelDAG", 5): ("--o", "NovelDAG f=5"),
+        ("NovelDAG", 1): ("-o", "NovelDAG f=1"),
+        ("NovelDAG", 3): ("--o", "NovelDAG f=3"),
         ("Narwhal", 0): ("-s", "Tusk f=0"),
         ("Narwhal", 5): ("--s", "Tusk f=5"),
+        ("Narwhal", 1): ("-s", "Tusk f=1"),
+        ("Narwhal", 3): ("--s", "Tusk f=3"),
+        ("Bullshark", 1): ("-^", "Bullshark f=1"),
+        ("Bullshark", 3): ("--^", "Bullshark f=3"),
         ("narwhal", 0): ("-s", "narwhal f=0"),
         ("narwhal", 5): ("--s", "narwhal f=5"),
     }
@@ -238,21 +249,21 @@ def main():
     script_root = Path(__file__).resolve().parent
     repo_root = script_root.parent
     projects = find_project_dirs(repo_root)
-    if len(projects) < 2:
-        print("Need at least two project folders (e.g., NovelDAG and Narwhal/narwhal)", file=sys.stderr)
+    if len(projects) < 3:
+        print("Need three project folders: NovelDAG, Narwhal (or narwhal), and Bullshark", file=sys.stderr)
         sys.exit(1)
 
     print("Projects:")
-    for name, path in projects:
-        print(f"- {name}: {path}")
+    for name, path, protocol in projects:
+        print(f"- {name}: {path} (protocol={protocol})")
 
     rates = list(range(20000, 160001, 20000))
-    faults_list = [0, 5]
+    faults_list = [1, 3]
     rounds = 3
     duration = 30
-    nodes = 16
+    nodes = 10
 
-    out_dir = script_root / "comparison_results" / "common_coin_n16_f0_f5"
+    out_dir = script_root / "comparison_results" / "triple_n10_f1_f3"
     runs_csv_path = out_dir / "runs.csv"
     avg_csv_path = out_dir / "average.csv"
 
@@ -291,7 +302,19 @@ def main():
 
     plot_enabled = True
 
-    for project_name, project_path in projects:
+    for project_name, project_path, protocol_label in projects:
+        node_parameters = {
+            "header_size": 1000,
+            "max_header_delay": 200,
+            "gc_depth": 50,
+            "sync_retry_delay": 10000,
+            "sync_retry_nodes": 3,
+            "batch_size": 500000,
+            "max_batch_delay": 200,
+        }
+        if protocol_label in {"common_coin", "round_robin"} and project_name != "Bullshark":
+            node_parameters["consensus_protocol"] = protocol_label
+
         bench_dir = project_path / "benchmark"
         for faults in faults_list:
             for rate in rates:
@@ -310,7 +333,15 @@ def main():
                         f"rate={rate} duration={duration}s run={run_idx}/{rounds}",
                         flush=True,
                     )
-                    metrics, stdout = run_one(bench_dir, nodes, faults, rate, duration)
+                    metrics, stdout = run_one(
+                        bench_dir,
+                        nodes,
+                        faults,
+                        rate,
+                        duration,
+                        node_parameters,
+                        protocol_label,
+                    )
                     row = {
                         "project": project_name,
                         "nodes": nodes,

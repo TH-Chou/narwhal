@@ -222,7 +222,10 @@ class Bench:
         # for the faulty nodes to be online).
         Print.info('Booting clients...')
         workers_addresses = committee.workers_addresses(faults)
-        rate_share = ceil(rate / committee.workers())
+        active_workers = sum(len(addresses) for addresses in workers_addresses)
+        if active_workers == 0:
+            raise BenchError('No active workers available to inject transactions')
+        rate_share = ceil(rate / active_workers)
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host = Committee.ip(address)
