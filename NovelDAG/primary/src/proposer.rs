@@ -145,6 +145,23 @@ impl Proposer {
     pub async fn run(&mut self) {
         debug!("Dag starting at round {}", self.round);
 
+        #[cfg(feature = "benchmark")]
+        let mut diag_blocked_attempts = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_missing_parents_1 = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_missing_parents_2 = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_missing_qc = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_blocked_windows = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_blocked_total_ms = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_blocked_since: Option<Instant> = None;
+        #[cfg(feature = "benchmark")]
+        let mut diag_headers_created = 0u64;
+
         let timer = sleep(Duration::from_millis(self.max_header_delay));
         tokio::pin!(timer);
 
@@ -159,10 +176,53 @@ impl Proposer {
             let enough_qc = self.round < 2 || self.last_qc.is_some();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
-            if (timer_expired || enough_digests) && enough_parents_1 && enough_parents_2 && enough_qc {
+            let ready_to_propose = timer_expired || enough_digests;
+
+            #[cfg(feature = "benchmark")]
+            if ready_to_propose && !(enough_parents_1 && enough_parents_2 && enough_qc) {
+                diag_blocked_attempts += 1;
+                if !enough_parents_1 {
+                    diag_missing_parents_1 += 1;
+                }
+                if !enough_parents_2 {
+                    diag_missing_parents_2 += 1;
+                }
+                if !enough_qc {
+                    diag_missing_qc += 1;
+                }
+                if diag_blocked_since.is_none() {
+                    diag_blocked_windows += 1;
+                    diag_blocked_since = Some(Instant::now());
+                }
+            }
+
+            if ready_to_propose && enough_parents_1 && enough_parents_2 && enough_qc {
+                #[cfg(feature = "benchmark")]
+                if let Some(started_at) = diag_blocked_since.take() {
+                    diag_blocked_total_ms += started_at.elapsed().as_millis() as u64;
+                }
+
                 // Make a new header.
                 self.make_header().await;
                 self.payload_size = 0;
+
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_headers_created += 1;
+                    if diag_headers_created % 20 == 0 {
+                        info!(
+                            "DIAG_PROPOSER_GATE round={} headers={} blocked_attempts={} blocked_windows={} missing_parents_1={} missing_parents_2={} missing_qc={} blocked_total_ms={}",
+                            self.round,
+                            diag_headers_created,
+                            diag_blocked_attempts,
+                            diag_blocked_windows,
+                            diag_missing_parents_1,
+                            diag_missing_parents_2,
+                            diag_missing_qc,
+                            diag_blocked_total_ms,
+                        );
+                    }
+                }
 
                 // Reschedule the timer.
                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);

@@ -184,6 +184,7 @@ def make_plots(avg_rows, out_dir: Path):
         return False
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    plot_context = "batch_size=512KB, tx_size=512B, nodes=10"
 
     # Plot 1: Injection rate (x) vs consensus TPS (y)
     plt.figure(figsize=(10, 6))
@@ -216,7 +217,7 @@ def make_plots(avg_rows, out_dir: Path):
 
     plt.xlabel("Injection Rate (tx/s)")
     plt.ylabel("Consensus TPS (tx/s)")
-    plt.title("Common Coin: Injection Rate vs Consensus TPS")
+    plt.title(f"Injection-TPS ({plot_context})")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -235,7 +236,8 @@ def make_plots(avg_rows, out_dir: Path):
 
     plt.xlabel("Consensus TPS (tx/s)")
     plt.ylabel("Consensus Latency (ms)")
-    plt.title("Common Coin: Consensus TPS vs Latency")
+    plt.title(f"TPS-Latency ({plot_context})")
+    plt.ylim(bottom=0)
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -257,13 +259,13 @@ def main():
     for name, path, protocol in projects:
         print(f"- {name}: {path} (protocol={protocol})")
 
-    rates = list(range(20000, 160001, 20000))
+    rates = list(range(20000, 280001, 20000))
     faults_list = [1, 3]
     rounds = 3
     duration = 30
     nodes = 10
 
-    out_dir = script_root / "comparison_results" / "triple_n10_f1_f3"
+    out_dir = script_root / "comparison_results" / "triple_n10_f1_f3_hdelay1000"
     runs_csv_path = out_dir / "runs.csv"
     avg_csv_path = out_dir / "average.csv"
 
@@ -291,7 +293,26 @@ def main():
         "runs",
     ]
 
-    rows = load_existing_runs(runs_csv_path)
+    existing_rows = load_existing_runs(runs_csv_path)
+    target_rates = set(rates)
+    target_faults = set(faults_list)
+    target_projects = {project_name for project_name, _, _ in projects}
+    rows = [
+        r
+        for r in existing_rows
+        if r["project"] in target_projects
+        and r["nodes"] == nodes
+        and r["faults"] in target_faults
+        and r["rate"] in target_rates
+        and r["duration"] == duration
+    ]
+    dropped = len(existing_rows) - len(rows)
+    if dropped > 0:
+        print(
+            f"Filtered out {dropped} stale entries from existing runs "
+            f"(outside current sweep config)."
+        )
+
     completed = {
         (r["project"], r["faults"], r["rate"], r["run"])
         for r in rows
@@ -302,6 +323,7 @@ def main():
 
     plot_enabled = True
 
+    project_runs = []
     for project_name, project_path, protocol_label in projects:
         node_parameters = {
             "header_size": 1000,
@@ -315,10 +337,12 @@ def main():
         if protocol_label in {"common_coin", "round_robin"} and project_name != "Bullshark":
             node_parameters["consensus_protocol"] = protocol_label
 
-        bench_dir = project_path / "benchmark"
-        for faults in faults_list:
-            for rate in rates:
-                for run_idx in range(1, rounds + 1):
+        project_runs.append((project_name, project_path / "benchmark", protocol_label, node_parameters))
+
+    for faults in faults_list:
+        for rate in rates:
+            for run_idx in range(1, rounds + 1):
+                for project_name, bench_dir, protocol_label, node_parameters in project_runs:
                     run_key = (project_name, faults, rate, run_idx)
                     if run_key in completed:
                         print(

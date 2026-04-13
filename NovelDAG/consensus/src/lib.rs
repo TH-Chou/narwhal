@@ -144,8 +144,34 @@ impl Consensus {
         let mut pending_coin_rounds = HashSet::new();
         let (coin_result_tx, mut coin_result_rx) = unbounded_channel::<(Round, Option<Round>)>();
 
+        #[cfg(feature = "benchmark")]
+        let mut diag_seen_certificates = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_commit_round_checks = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_skip_not_wave_boundary = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_skip_round_no_quorum = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_skip_leader_already_committed = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_skip_leader_unavailable = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_skip_missing_b2 = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_skip_missing_b1 = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_skip_qc_chain_invalid = 0u64;
+        #[cfg(feature = "benchmark")]
+        let mut diag_commits_emitted = 0u64;
+
         // Listen to incoming certificates.
         while let Some(certificate) = self.rx_primary.recv().await {
+            #[cfg(feature = "benchmark")]
+            {
+                diag_seen_certificates += 1;
+            }
+
             while let Ok((round, coin)) = coin_result_rx.try_recv() {
                 pending_coin_rounds.remove(&round);
                 if let Some(coin) = coin {
@@ -176,12 +202,25 @@ impl Consensus {
             // - require embedded QC links b2->b3 and b1->b2.
             let commit_round = round;
 
+            #[cfg(feature = "benchmark")]
+            {
+                diag_commit_round_checks += 1;
+            }
+
             if commit_round < ROUNDS_PER_WAVE || commit_round % ROUNDS_PER_WAVE != 0 {
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_skip_not_wave_boundary += 1;
+                }
                 continue;
             }
 
             // We only consider a round ended for commit purposes once we have a quorum for that round.
             if !self.round_has_quorum(commit_round, &state.dag) {
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_skip_round_no_quorum += 1;
+                }
                 continue;
             }
 
@@ -189,6 +228,10 @@ impl Consensus {
             // there is nothing to do.
             let leader_round = commit_round - (ROUNDS_PER_WAVE - 1);
             if leader_round <= state.last_committed_round {
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_skip_leader_already_committed += 1;
+                }
                 continue;
             }
 
@@ -209,20 +252,38 @@ impl Consensus {
 
             let (_, leader) = match self.leader(leader_round, commit_round, &state.dag, &coin_cache) {
                 Some(x) => x,
-                None => continue,
+                None => {
+                    #[cfg(feature = "benchmark")]
+                    {
+                        diag_skip_leader_unavailable += 1;
+                    }
+                    continue;
+                }
             };
 
             let b3 = leader.clone();
             let Some(b2) = self.certificate_by_author(leader_round + 1, b3.origin(), &state.dag) else {
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_skip_missing_b2 += 1;
+                }
                 continue;
             };
             let Some(b1) = self.certificate_by_author(leader_round + 2, b3.origin(), &state.dag) else {
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_skip_missing_b1 += 1;
+                }
                 continue;
             };
 
             if !self.embedded_qc_links(b2, &b3, commit_round)
                 || !self.embedded_qc_links(b1, b2, commit_round)
             {
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_skip_qc_chain_invalid += 1;
+                }
                 debug!("Leader {:?} does not satisfy b3->b2->b1 QC chain", b3);
                 continue;
             }
@@ -263,6 +324,29 @@ impl Consensus {
                 if let Err(e) = self.tx_output.send(certificate).await {
                     warn!("Failed to output certificate: {}", e);
                 }
+
+                #[cfg(feature = "benchmark")]
+                {
+                    diag_commits_emitted += 1;
+                }
+            }
+
+            #[cfg(feature = "benchmark")]
+            if commit_round % 20 == 0 {
+                info!(
+                    "DIAG_CONSENSUS_COMMIT round={} seen_certificates={} commit_checks={} commits_emitted={} skip_not_wave_boundary={} skip_round_no_quorum={} skip_leader_already_committed={} skip_leader_unavailable={} skip_missing_b2={} skip_missing_b1={} skip_qc_chain_invalid={}",
+                    commit_round,
+                    diag_seen_certificates,
+                    diag_commit_round_checks,
+                    diag_commits_emitted,
+                    diag_skip_not_wave_boundary,
+                    diag_skip_round_no_quorum,
+                    diag_skip_leader_already_committed,
+                    diag_skip_leader_unavailable,
+                    diag_skip_missing_b2,
+                    diag_skip_missing_b1,
+                    diag_skip_qc_chain_invalid,
+                );
             }
         }
     }
