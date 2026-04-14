@@ -31,6 +31,9 @@ class ExecutionError(Exception):
 
 
 class Bench:
+    SSH_RETRIES = 5
+    SSH_RETRY_DELAY_SECONDS = 3
+
     def __init__(self, ctx):
         self.manager = InstanceManager.make()
         self.settings = self.manager.settings
@@ -132,9 +135,27 @@ class Bench:
     def _background_run(self, host, command, log_file):
         name = splitext(basename(log_file))[0]
         cmd = f'tmux new -d -s "{name}" "{command} |& tee {log_file}"'
-        c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
-        output = c.run(cmd, hide=True)
-        self._check_stderr(output)
+        last_error = None
+        for attempt in range(1, self.SSH_RETRIES + 1):
+            try:
+                c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+                output = c.run(cmd, hide=True)
+                self._check_stderr(output)
+                return
+            except (SSHException, OSError, EOFError) as e:
+                last_error = e
+                if attempt == self.SSH_RETRIES:
+                    break
+                Print.warn(
+                    f'SSH transient error on {host} while starting {name} '
+                    f'(attempt {attempt}/{self.SSH_RETRIES}): {e}'
+                )
+                sleep(self.SSH_RETRY_DELAY_SECONDS)
+
+        raise ExecutionError(
+            f'Failed to start remote command on {host} after '
+            f'{self.SSH_RETRIES} attempts: {last_error}'
+        )
 
     def _update(self, hosts, collocate):
         if collocate:
@@ -145,15 +166,29 @@ class Bench:
         Print.info(
             f'Updating {len(ips)} machines (branch "{self.settings.branch}")...'
         )
+        repo = self.settings.repo_name
+        workspace_discovery = (
+            f'if [ -d "{repo}/Bullshark/node" ]; then '
+            f'echo "{repo}/Bullshark"; '
+            f'elif [ -d "{repo}/node" ]; then '
+            f'echo "{repo}"; '
+            'else '
+            'echo "Cannot locate node crate directory" >&2; '
+            'exit 1; '
+            'fi'
+        )
         cmd = [
-            f'(cd {self.settings.repo_name} && git fetch -f)',
-            f'(cd {self.settings.repo_name} && git checkout -f {self.settings.branch})',
-            f'(cd {self.settings.repo_name} && git pull -f)',
+            f'(cd {repo} && git fetch -f)',
+            f'(cd {repo} && git checkout -f {self.settings.branch})',
+            f'(cd {repo} && git pull -f)',
             'source $HOME/.cargo/env',
-            f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
-            CommandMaker.alias_binaries(
-                f'./{self.settings.repo_name}/target/release/'
-            )
+            f'WORKSPACE_DIR=$({workspace_discovery})',
+            f'(cd "$WORKSPACE_DIR/node" && {CommandMaker.compile()})',
+            'rm -f node benchmark_client',
+            'ln -s "./$WORKSPACE_DIR/target/release/node" node',
+            'ln -s "./$WORKSPACE_DIR/target/release/benchmark_client" benchmark_client',
+            'test -x ./node',
+            'test -x ./benchmark_client',
         ]
         g = Group(*ips, user='ubuntu', connect_kwargs=self.connect)
         g.run(' && '.join(cmd), hide=True)
@@ -366,7 +401,7 @@ class Bench:
                             r, 
                             bench_parameters.tx_size, 
                         ))
-                    except (subprocess.SubprocessError, GroupException, ParseError) as e:
+                    except (subprocess.SubprocessError, GroupException, ParseError, ExecutionError) as e:
                         self.kill(hosts=selected_hosts)
                         if isinstance(e, GroupException):
                             e = FabricError(e)

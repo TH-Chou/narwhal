@@ -108,18 +108,50 @@ class InstanceManager:
         )
 
     def _get_ami(self, client):
-        # The AMI changes with regions.
-        response = client.describe_images(
-            Filters=[
-                {
-                    "Name": "description",
-                    "Values": [
-                        "Canonical, Ubuntu, 22.04 LTS, amd64 jammy image build on 2023-09-19"
-                    ],
-                }
-            ]
-        )
-        return response["Images"][0]["ImageId"]
+        # The AMI changes with regions and over time, thus we select the latest
+        # available Ubuntu 22.04 image published by Canonical.
+        name_patterns = [
+            "ubuntu/images/hvm-ssd-gp3/ubuntu-jammy-22.04-amd64-server-*",
+            "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
+            "ubuntu/images/hvm-ssd*/ubuntu-jammy-22.04-amd64-server-*",
+        ]
+        images = []
+        for pattern in name_patterns:
+            response = client.describe_images(
+                Owners=["099720109477"],
+                Filters=[
+                    {
+                        "Name": "name",
+                        "Values": [pattern],
+                    },
+                    {"Name": "state", "Values": ["available"]},
+                    {"Name": "architecture", "Values": ["x86_64"]},
+                    {"Name": "root-device-type", "Values": ["ebs"]},
+                    {"Name": "virtualization-type", "Values": ["hvm"]},
+                ],
+            )
+            images.extend(response.get("Images", []))
+
+        unique_images = {}
+        for image in images:
+            image_id = image.get("ImageId")
+            if image_id:
+                unique_images[image_id] = image
+        images = list(unique_images.values())
+
+        if not images:
+            region = client.meta.region_name
+            message = (
+                "Failed to find a compatible Ubuntu 22.04 AMI in region "
+                f"{region}. Check EC2 Allowed AMIs policy and region availability."
+            )
+            raise BenchError(
+                message,
+                RuntimeError(message),
+            )
+
+        images.sort(key=lambda x: x.get("CreationDate", ""), reverse=True)
+        return images[0]["ImageId"]
 
     def create_instances(self, instances):
         assert isinstance(instances, int) and instances > 0

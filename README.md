@@ -68,6 +68,23 @@ See `node/src/main.rs` for full CLI flags and required config files.
 - Worker module notes: `worker/README.md`
 - Protocol notes for this repo: `new DAG structure.md`
 
+## Aws
+
+    cd /Users/apple/Documents/narwhal
+source /Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/activate
+python -u .test/run_triple_aws_benchmark.py \
+  --nodes=10 \
+  --faults=1,3 \
+  --rate-start=30000 \
+  --rate-step=30000 \
+  --rate-end=420000 \
+  --rounds=3 \
+  --duration=20 \
+  --out-dir=triple_aws_n10_f1_f3_hdelay200 \
+  --fab-bin=/Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/fab \
+  --remote-retries=5 \
+  --retry-delay=15
+
 ## License
 
 This software is licensed as [Apache 2.0](LICENSE).

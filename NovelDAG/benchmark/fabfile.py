@@ -563,7 +563,18 @@ def install(ctx):
 
 
 @task
-def remote(ctx, debug=False, protocol='round_robin'):
+def remote(
+    ctx,
+    debug=False,
+    protocol='round_robin',
+    faults=3,
+    nodes=10,
+    workers=1,
+    rate=10_000,
+    tx_size=512,
+    duration=300,
+    runs=2,
+):
     ''' Run benchmarks on AWS '''
     from benchmark.remote import Bench
 
@@ -571,14 +582,14 @@ def remote(ctx, debug=False, protocol='round_robin'):
         raise BenchError('Invalid protocol: must be round_robin or common_coin')
 
     bench_params = {
-        'faults': 3,
-        'nodes': [10],
-        'workers': 1,
+        'faults': int(faults),
+        'nodes': [int(nodes)],
+        'workers': int(workers),
         'collocate': True,
-        'rate': [10_000, 110_000],
-        'tx_size': 512,
-        'duration': 300,
-        'runs': 2,
+        'rate': [int(rate)],
+        'tx_size': int(tx_size),
+        'duration': int(duration),
+        'runs': int(runs),
     }
     node_params = {
         'header_size': 1_000,  # bytes
