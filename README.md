@@ -69,22 +69,31 @@ See `node/src/main.rs` for full CLI flags and required config files.
 - Protocol notes for this repo: `new DAG structure.md`
 
 ## Aws
+fab create --nodes=2
+fab start
 
-    cd /Users/apple/Documents/narwhal
-source /Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/activate
-python -u .test/run_triple_aws_benchmark.py \
+fab info
+fab install
+fab kill
+
+python -u /Users/apple/Documents/narwhal/.test/run_triple_aws_batch_benchmark.py \
   --nodes=10 \
   --faults=1,3 \
-  --rate-start=30000 \
-  --rate-step=30000 \
-  --rate-end=420000 \
+  --rate-start=20000 \
+  --rate-step=20000 \
+  --rate-end=220000 \
   --rounds=3 \
   --duration=20 \
-  --out-dir=triple_aws_n10_f1_f3_hdelay200 \
+  --out-dir=triple_aws_batch_streamed \
   --fab-bin=/Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/fab \
+  --batch-prefix=tripleaws-streamed \
+  --phase=all \
   --remote-retries=5 \
-  --retry-delay=15
+  --retry-delay=15 \
+  --collect-poll-seconds=120
 
+fab stop
+fab destroy
 ## License
 
 This software is licensed as [Apache 2.0](LICENSE).

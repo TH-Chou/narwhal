@@ -5,6 +5,7 @@ from fabric.exceptions import GroupException
 from paramiko import RSAKey
 from paramiko.ssh_exception import PasswordRequiredException, SSHException
 from os.path import basename, splitext
+from pathlib import Path
 from time import sleep
 from math import ceil
 from copy import deepcopy
@@ -91,11 +92,20 @@ class Bench:
         hosts = hosts if hosts else self.manager.hosts(flat=True)
         delete_logs = CommandMaker.clean_logs() if delete_logs else 'true'
         cmd = [delete_logs, f'({CommandMaker.kill()} || true)']
-        try:
-            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
-            g.run(' && '.join(cmd), hide=True)
-        except GroupException as e:
-            raise BenchError('Failed to kill nodes', FabricError(e))
+        for attempt in range(1, self.SSH_RETRIES + 1):
+            try:
+                g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+                g.run(' && '.join(cmd), hide=True)
+                return
+            except GroupException as e:
+                if 'Error reading SSH protocol banner' in str(e) and attempt < self.SSH_RETRIES:
+                    Print.warn(
+                        f'SSH transient error while killing nodes '
+                        f'(attempt {attempt}/{self.SSH_RETRIES}); retrying...'
+                    )
+                    sleep(self.SSH_RETRY_DELAY_SECONDS)
+                    continue
+                raise BenchError('Failed to kill nodes', FabricError(e))
 
     def _select_hosts(self, bench_parameters):
         # Collocate the primary and its workers on the same machine.
@@ -343,6 +353,115 @@ class Bench:
         # Parse logs and return the parser.
         Print.info('Parsing logs and computing performance...')
         return LogParser.process(PathMaker.logs_path(), faults=faults)
+
+    def _checkpoint_logs(self, hosts, batch_id, run_id):
+        assert isinstance(hosts, list)
+        assert isinstance(batch_id, str) and batch_id
+        assert isinstance(run_id, str) and run_id
+        if not hosts:
+            return
+
+        remote_dir = f'batch_logs/{batch_id}/{run_id}'
+        cmd = [
+            f'mkdir -p "{remote_dir}"',
+            f'for f in "{PathMaker.logs_path()}"/*.log; do [ -f "$f" ] || continue; cp "$f" "{remote_dir}/"; done',
+        ]
+        g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+        g.run(' && '.join(cmd), hide=True)
+
+    def run_batch(self, bench_parameters_dict, node_parameters_dict, batch_id, debug=False):
+        assert isinstance(debug, bool)
+        assert isinstance(batch_id, str) and batch_id
+        Print.heading(f'Starting remote batch benchmark (batch_id={batch_id})')
+        try:
+            bench_parameters = BenchParameters(bench_parameters_dict)
+            node_parameters = NodeParameters(node_parameters_dict)
+        except ConfigError as e:
+            raise BenchError('Invalid nodes or bench parameters', e)
+
+        selected_hosts = self._select_hosts(bench_parameters)
+        if not selected_hosts:
+            Print.warn('There are not enough instances available')
+            return
+
+        try:
+            self._update(selected_hosts, bench_parameters.collocate)
+        except (GroupException, ExecutionError) as e:
+            e = FabricError(e) if isinstance(e, GroupException) else e
+            raise BenchError('Failed to update nodes', e)
+
+        try:
+            committee = self._config(
+                selected_hosts, node_parameters, bench_parameters
+            )
+        except (subprocess.SubprocessError, GroupException) as e:
+            e = FabricError(e) if isinstance(e, GroupException) else e
+            raise BenchError('Failed to configure nodes', e)
+
+        for n in bench_parameters.nodes:
+            committee_copy = deepcopy(committee)
+            committee_copy.remove_nodes(committee.size() - n)
+
+            for r in bench_parameters.rate:
+                Print.heading(f'\nRunning {n} nodes (input rate: {r:,} tx/s)')
+
+                for i in range(bench_parameters.runs):
+                    run_id = f'f{bench_parameters.faults}-n{n}-r{r}-run{i+1}'
+                    Print.heading(f'Run {i+1}/{bench_parameters.runs} [{run_id}]')
+                    try:
+                        self._run_single(
+                            r, committee_copy, bench_parameters, debug
+                        )
+                        self._checkpoint_logs(
+                            committee_copy.ips(),
+                            batch_id,
+                            run_id,
+                        )
+                    except (BenchError, subprocess.SubprocessError, GroupException, ParseError, ExecutionError) as e:
+                        self.kill(hosts=selected_hosts)
+                        if isinstance(e, GroupException):
+                            e = FabricError(e)
+                        if isinstance(e, BenchError):
+                            Print.error(e)
+                        else:
+                            Print.error(BenchError('Batch benchmark run failed', e))
+                        continue
+
+    def collect_batch(self, batch_id, output_directory='batch_downloads'):
+        assert isinstance(batch_id, str) and batch_id
+        assert isinstance(output_directory, str) and output_directory
+
+        hosts = self.manager.hosts(flat=True)
+        if not hosts:
+            Print.warn('There are no instances available to collect logs from')
+            return
+
+        output_path = Path(output_directory).expanduser().resolve()
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        Print.info(
+            f'Downloading archived logs for batch_id={batch_id} into {output_path}'
+        )
+        progress = progress_bar(hosts, prefix='Downloading archived logs:')
+        for host in progress:
+            host_tag = host.replace('.', '-')
+            remote_archive = f'/tmp/{batch_id}-{host_tag}.tar.gz'
+            local_archive = output_path / f'{host_tag}.tar.gz'
+            c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+            result = c.run(
+                f'test -d batch_logs/{batch_id} && '
+                f'tar -czf {remote_archive} -C batch_logs {batch_id}',
+                hide=True,
+                warn=True,
+            )
+            if not result.ok:
+                Print.warn(
+                    f'No batch logs found on host {host} for batch_id={batch_id}'
+                )
+                continue
+
+            c.get(remote_archive, local=str(local_archive))
+            c.run(f'rm -f {remote_archive}', hide=True, warn=True)
 
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
