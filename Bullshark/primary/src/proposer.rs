@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
 use crate::primary::Round;
-use config::{Committee, WorkerId};
+use config::{Committee, ConsensusProtocol, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 #[cfg(feature = "benchmark")]
@@ -21,6 +21,8 @@ pub struct Proposer {
     name: PublicKey,
     /// The committee information.
     committee: Committee,
+    /// The consensus leader election mode.
+    consensus_protocol: ConsensusProtocol,
     /// Service to sign headers.
     signature_service: SignatureService,
     /// The size of the headers' payload.
@@ -52,6 +54,7 @@ impl Proposer {
     pub fn spawn(
         name: PublicKey,
         committee: Committee,
+        consensus_protocol: ConsensusProtocol,
         signature_service: SignatureService,
         header_size: usize,
         max_header_delay: u64,
@@ -64,6 +67,7 @@ impl Proposer {
             Self {
                 name,
                 committee,
+                consensus_protocol,
                 signature_service,
                 header_size,
                 max_header_delay,
@@ -106,9 +110,68 @@ impl Proposer {
             .expect("Failed to send header");
     }
 
+    fn round_robin_coin(&self, round: Round) -> Round {
+        #[cfg(test)]
+        {
+            let _ = round;
+            0
+        }
+        #[cfg(not(test))]
+        {
+            round
+        }
+    }
+
+    fn common_coin_from_parents(&self) -> Option<Round> {
+        if self.last_parents.is_empty() {
+            return None;
+        }
+
+        let weight = self
+            .last_parents
+            .iter()
+            .map(|certificate| self.committee.stake(&certificate.origin()))
+            .sum::<u32>();
+        if weight < self.committee.quorum_threshold() {
+            return None;
+        }
+
+        let mut digests: Vec<_> = self.last_parents.iter().map(|certificate| certificate.digest()).collect();
+        digests.sort();
+
+        let mut seed = self.round;
+        for digest in digests {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&digest.0[..8]);
+            seed ^= u64::from_le_bytes(chunk);
+            seed = seed.rotate_left(13).wrapping_mul(0x9E37_79B1_85EB_CA87);
+        }
+        Some(seed)
+    }
+
     /// Update the last leader.
     fn update_leader(&mut self) -> bool {
-        let leader_name = self.committee.leader(self.round as usize);
+        let leader_name = match self.consensus_protocol {
+            ConsensusProtocol::RoundRobin => self.committee.leader(self.round as usize),
+            ConsensusProtocol::CommonCoin => {
+                let mut keys: Vec<_> = self
+                    .last_parents
+                    .iter()
+                    .map(|certificate| certificate.origin())
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                if keys.is_empty() {
+                    self.last_leader = None;
+                    return false;
+                }
+
+                let coin = self
+                    .common_coin_from_parents()
+                    .unwrap_or_else(|| self.round_robin_coin(self.round));
+                keys[coin as usize % keys.len()]
+            }
+        };
         self.last_leader = self
             .last_parents
             .iter()

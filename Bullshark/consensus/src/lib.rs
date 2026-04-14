@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use config::{Committee, Stake};
+use config::{Committee, ConsensusProtocol, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
@@ -67,6 +67,8 @@ pub struct Consensus {
     committee: Committee,
     /// The depth of the garbage collector.
     gc_depth: Round,
+    /// The consensus leader election mode.
+    consensus_protocol: ConsensusProtocol,
 
     /// Receives new certificates from the primary. The primary should send us new certificates only
     /// if it already sent us its whole history.
@@ -88,10 +90,29 @@ impl Consensus {
         tx_primary: Sender<Certificate>,
         tx_output: Sender<Certificate>,
     ) {
+        Self::spawn_with_protocol(
+            committee,
+            gc_depth,
+            ConsensusProtocol::RoundRobin,
+            rx_primary,
+            tx_primary,
+            tx_output,
+        );
+    }
+
+    pub fn spawn_with_protocol(
+        committee: Committee,
+        gc_depth: Round,
+        consensus_protocol: ConsensusProtocol,
+        rx_primary: Receiver<Certificate>,
+        tx_primary: Sender<Certificate>,
+        tx_output: Sender<Certificate>,
+    ) {
         tokio::spawn(async move {
             Self {
                 committee: committee.clone(),
                 gc_depth,
+                consensus_protocol,
                 rx_primary,
                 tx_primary,
                 tx_output,
@@ -201,19 +222,66 @@ impl Consensus {
     /// Returns the certificate (and the certificate's digest) originated by the leader of the
     /// specified round (if any).
     fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
-        // TODO: We should elect the leader of round r-2 using the common coin revealed at round r.
-        // At this stage, we are guaranteed to have 2f+1 certificates from round r (which is enough to
-        // compute the coin). We currently just use round-robin.
+        let by_round = dag.get(&round)?;
+        let leader = match self.consensus_protocol {
+            ConsensusProtocol::RoundRobin => {
+                let coin = self.round_robin_coin(round);
+                let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
+                keys.sort();
+                keys[coin as usize % self.committee.size()]
+            }
+            ConsensusProtocol::CommonCoin => {
+                let coin = self
+                    .common_coin(round, dag)
+                    .unwrap_or_else(|| self.round_robin_coin(round));
+                let mut keys: Vec<_> = by_round.keys().cloned().collect();
+                if keys.is_empty() {
+                    return None;
+                }
+                keys.sort();
+                keys[coin as usize % keys.len()]
+            }
+        };
+
+        by_round.get(&leader)
+    }
+
+    fn round_robin_coin(&self, round: Round) -> Round {
         #[cfg(test)]
-        let seed = 0;
+        {
+            let _ = round;
+            0
+        }
         #[cfg(not(test))]
-        let seed = round;
+        {
+            round
+        }
+    }
 
-        // Elect the leader.
-        let leader = self.committee.leader(seed as usize);
+    fn common_coin(&self, round: Round, dag: &Dag) -> Option<Round> {
+        let certificates = dag.get(&round)?;
+        let weight: Stake = certificates
+            .values()
+            .map(|(_, certificate)| self.committee.stake(&certificate.origin()))
+            .sum();
+        if weight < self.committee.quorum_threshold() {
+            return None;
+        }
 
-        // Return its certificate and the certificate's digest.
-        dag.get(&round).map(|x| x.get(&leader)).flatten()
+        let mut digests: Vec<_> = certificates
+            .values()
+            .map(|(digest, _)| digest.clone())
+            .collect();
+        digests.sort();
+
+        let mut seed = round;
+        for digest in digests {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&digest.0[..8]);
+            seed ^= u64::from_le_bytes(chunk);
+            seed = seed.rotate_left(13).wrapping_mul(0x9E37_79B1_85EB_CA87);
+        }
+        Some(seed)
     }
 
     /// Order the past leaders that we didn't already commit.

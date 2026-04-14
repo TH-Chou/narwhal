@@ -10,8 +10,11 @@ from benchmark.remote import Bench, BenchError
 
 
 @task
-def local(ctx, debug=True):
+def local(ctx, debug=True, protocol='round_robin'):
     ''' Run benchmarks on localhost '''
+    if protocol not in ('round_robin', 'common_coin'):
+        raise BenchError('Invalid protocol: must be round_robin or common_coin')
+
     bench_params = {
         'faults': 0,
         'nodes': 4,
@@ -27,7 +30,8 @@ def local(ctx, debug=True):
         'sync_retry_delay': 10_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
-        'max_batch_delay': 200  # ms
+        'max_batch_delay': 200,  # ms
+        'consensus_protocol': protocol,
     }
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
@@ -91,8 +95,11 @@ def install(ctx):
 
 
 @task
-def remote(ctx, debug=False):
+def remote(ctx, debug=False, protocol='round_robin'):
     ''' Run benchmarks on AWS '''
+    if protocol not in ('round_robin', 'common_coin'):
+        raise BenchError('Invalid protocol: must be round_robin or common_coin')
+
     bench_params = {
         'faults': 3,
         'nodes': [10],
@@ -110,7 +117,8 @@ def remote(ctx, debug=False):
         'sync_retry_delay': 10_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
-        'max_batch_delay': 200  # ms
+        'max_batch_delay': 200,  # ms
+        'consensus_protocol': protocol,
     }
     try:
         Bench(ctx).run(bench_params, node_params, debug)

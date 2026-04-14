@@ -189,6 +189,7 @@ impl Primary {
         Proposer::spawn(
             name,
             committee.clone(),
+            parameters.consensus_protocol,
             signature_service,
             parameters.header_size,
             parameters.max_header_delay,

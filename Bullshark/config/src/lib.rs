@@ -58,6 +58,28 @@ pub trait Export: Serialize {
 pub type Stake = u32;
 pub type WorkerId = u32;
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsensusProtocol {
+    RoundRobin,
+    CommonCoin,
+}
+
+impl Default for ConsensusProtocol {
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+impl ConsensusProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::CommonCoin => "common_coin",
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
 pub struct Parameters {
     /// The preferred header size. The primary creates a new header when it has enough parents and
@@ -79,6 +101,9 @@ pub struct Parameters {
     /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
     /// is not reached. Denominated in ms.
     pub max_batch_delay: u64,
+    /// The consensus leader election mode.
+    #[serde(default)]
+    pub consensus_protocol: ConsensusProtocol,
 }
 
 impl Default for Parameters {
@@ -91,6 +116,7 @@ impl Default for Parameters {
             sync_retry_nodes: 3,
             batch_size: 500_000,
             max_batch_delay: 100,
+            consensus_protocol: ConsensusProtocol::RoundRobin,
         }
     }
 }
@@ -106,6 +132,10 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Batch size set to {} B", self.batch_size);
         info!("Max batch delay set to {} ms", self.max_batch_delay);
+        info!(
+            "Consensus protocol set to {}",
+            self.consensus_protocol.as_str()
+        );
     }
 }
 

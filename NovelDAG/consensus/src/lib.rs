@@ -1,12 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use config::{Committee, ConsensusProtocol, Stake};
 use crypto::Hash as _;
-use crypto::{coin_threshold, recover_coin, Digest, PublicKey};
+use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc::{unbounded_channel, Receiver, Sender, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
 #[path = "tests/consensus_tests.rs"]
@@ -14,18 +14,10 @@ pub mod consensus_tests;
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
-type CoinCache = HashMap<Round, Round>;
 
 /// Number of DAG rounds in one consensus wave.
 /// Keep this even so the leader interval (`ROUNDS_PER_WAVE / 2`) is integral.
 const ROUNDS_PER_WAVE: Round = 4;
-
-struct CoinComputationInput {
-    round: Round,
-    authorities: Vec<PublicKey>,
-    threshold: usize,
-    shares: Vec<(PublicKey, Vec<u8>)>,
-}
 
 /// The state that needs to be persisted for crash-recovery.
 struct State {
@@ -140,9 +132,6 @@ impl Consensus {
 
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
-        let mut coin_cache = CoinCache::new();
-        let mut pending_coin_rounds = HashSet::new();
-        let (coin_result_tx, mut coin_result_rx) = unbounded_channel::<(Round, Option<Round>)>();
 
         #[cfg(feature = "benchmark")]
         let mut diag_seen_certificates = 0u64;
@@ -172,13 +161,6 @@ impl Consensus {
                 diag_seen_certificates += 1;
             }
 
-            while let Ok((round, coin)) = coin_result_rx.try_recv() {
-                pending_coin_rounds.remove(&round);
-                if let Some(coin) = coin {
-                    coin_cache.insert(round, coin);
-                }
-            }
-
             debug!("Processing {:?}", certificate);
             let round = certificate.round();
 
@@ -188,13 +170,7 @@ impl Consensus {
                 .entry(round)
                 .or_insert_with(HashMap::new)
                 .insert(certificate.origin(), (certificate.digest(), certificate));
-            self.schedule_common_coin(
-                round,
-                &state.dag,
-                &mut pending_coin_rounds,
-                &coin_cache,
-                &coin_result_tx,
-            );
+
             // Try to order the dag to commit using the section-6 rule from DAG构建(1).md:
             // - trigger only when round r ends and r is a multiple of 4;
             // - elect leader at round r-3;
@@ -235,22 +211,7 @@ impl Consensus {
                 continue;
             }
 
-            if matches!(self.consensus_protocol, ConsensusProtocol::CommonCoin)
-                && !coin_cache.contains_key(&commit_round)
-            {
-                if let Some(input) = self.common_coin_input(commit_round, &state.dag) {
-                    if let Some(coin) = recover_coin(
-                        &input.authorities,
-                        input.threshold,
-                        input.round,
-                        &input.shares,
-                    ) {
-                        coin_cache.insert(commit_round, coin);
-                    }
-                }
-            }
-
-            let (_, leader) = match self.leader(leader_round, commit_round, &state.dag, &coin_cache) {
+            let (_, leader) = match self.leader(leader_round, commit_round, &state.dag) {
                 Some(x) => x,
                 None => {
                     #[cfg(feature = "benchmark")]
@@ -358,7 +319,6 @@ impl Consensus {
         round: Round,
         coin_round: Round,
         dag: &'a Dag,
-        coin_cache: &CoinCache,
     ) -> Option<&'a (Digest, Certificate)> {
         let by_round = dag.get(&round)?;
 
@@ -367,22 +327,15 @@ impl Consensus {
         // - a reproducible common-coin value derived from round-r certificates.
         let leader = match self.consensus_protocol {
             ConsensusProtocol::RoundRobin => {
-                let coin = {
-                    #[cfg(test)]
-                    {
-                        0
-                    }
-                    #[cfg(not(test))]
-                    {
-                        round
-                    }
-                };
+                let coin = self.round_robin_coin(round);
                 let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
                 keys.sort();
                 keys[coin as usize % self.committee.size()]
             }
             ConsensusProtocol::CommonCoin => {
-                let coin = *coin_cache.get(&coin_round)?;
+                let coin = self
+                    .common_coin(coin_round, dag)
+                    .unwrap_or_else(|| self.round_robin_coin(round));
                 let mut keys: Vec<_> = by_round.keys().cloned().collect();
                 if keys.is_empty() {
                     return None;
@@ -396,67 +349,42 @@ impl Consensus {
         by_round.get(&leader)
     }
 
-    fn common_coin_input(&self, round: Round, dag: &Dag) -> Option<CoinComputationInput> {
-        let certificates = dag.get(&round)?;
-        let quorum = self.committee.quorum_threshold() as usize;
-        let threshold = coin_threshold(self.committee.size());
+    fn round_robin_coin(&self, round: Round) -> Round {
+        #[cfg(test)]
+        {
+            let _ = round;
+            0
+        }
+        #[cfg(not(test))]
+        {
+            round
+        }
+    }
 
-        let mut certificates: Vec<&Certificate> =
-            certificates.values().map(|(_, certificate)| certificate).collect();
-        certificates.sort_by_key(|certificate| certificate.digest());
-        if certificates.len() < quorum {
+    fn common_coin(&self, round: Round, dag: &Dag) -> Option<Round> {
+        let certificates = dag.get(&round)?;
+        let weight: Stake = certificates
+            .values()
+            .map(|(_, certificate)| self.committee.stake(&certificate.origin()))
+            .sum();
+        if weight < self.committee.quorum_threshold() {
             return None;
         }
 
-        let authorities: Vec<PublicKey> = self.committee.authorities.keys().cloned().collect();
-        let mut shares = Vec::new();
-        for certificate in certificates.into_iter().take(quorum) {
-            if certificate.header.coin_share.is_empty() {
-                continue;
-            }
-            shares.push((
-                certificate.origin(),
-                certificate.header.coin_share.clone(),
-            ));
-        }
+        let mut digests: Vec<_> = certificates
+            .values()
+            .map(|(digest, _)| digest.clone())
+            .collect();
+        digests.sort();
 
-        Some(CoinComputationInput {
-            round,
-            authorities,
-            threshold,
-            shares,
-        })
-    }
-
-    fn schedule_common_coin(
-        &self,
-        round: Round,
-        dag: &Dag,
-        pending_coin_rounds: &mut HashSet<Round>,
-        coin_cache: &CoinCache,
-        coin_result_tx: &UnboundedSender<(Round, Option<Round>)>,
-    ) {
-        if !matches!(self.consensus_protocol, ConsensusProtocol::CommonCoin) {
-            return;
+        let mut seed = round;
+        for digest in digests {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&digest.0[..8]);
+            seed ^= u64::from_le_bytes(chunk);
+            seed = seed.rotate_left(13).wrapping_mul(0x9E37_79B1_85EB_CA87);
         }
-        if coin_cache.contains_key(&round) || pending_coin_rounds.contains(&round) {
-            return;
-        }
-        let input = match self.common_coin_input(round, dag) {
-            Some(input) => input,
-            None => return,
-        };
-        pending_coin_rounds.insert(round);
-        let tx = coin_result_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let coin = recover_coin(
-                &input.authorities,
-                input.threshold,
-                input.round,
-                &input.shares,
-            );
-            let _ = tx.send((input.round, coin));
-        });
+        Some(seed)
     }
 
     fn round_has_quorum(&self, round: Round, dag: &Dag) -> bool {
