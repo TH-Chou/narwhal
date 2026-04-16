@@ -69,6 +69,9 @@ See `node/src/main.rs` for full CLI flags and required config files.
 - Protocol notes for this repo: `new DAG structure.md`
 
 ## Aws
+
+source /Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/activate
+
 fab create --nodes=2
 fab start
 
@@ -82,7 +85,7 @@ python -u /Users/apple/Documents/narwhal/.test/run_triple_aws_batch_benchmark.py
   --rate-start=20000 \
   --rate-step=20000 \
   --rate-end=220000 \
-  --rounds=3 \
+  --rounds=2 \
   --duration=20 \
   --out-dir=triple_aws_batch_streamed \
   --fab-bin=/Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/fab \
@@ -94,6 +97,70 @@ python -u /Users/apple/Documents/narwhal/.test/run_triple_aws_batch_benchmark.py
 
 fab stop
 fab destroy
+
+## Gcp
+
+在三套 benchmark 的 `settings.json` 中把 provider 切换为 gcp（`NovelDAG/benchmark/settings.json`、`Narwhal/benchmark/settings.json`、`Bullshark/benchmark/settings.json`）：
+
+```json
+{
+  "provider": "gcp",
+  "key": {
+    "name": "gcp_dag_rsa",
+    "path": "/Users/apple/.ssh/gcp_dag_rsa"
+  },
+  "port": 5000,
+  "repo": {
+    "name": "narwhal",
+    "url": "https://github.com/TH-Chou/narwhal.git",
+    "branch": "master"
+  },
+  "instances": {
+    "type": "n2-standard-2",
+    "project": "<YOUR_GCP_PROJECT>",
+    "zones": ["us-central1-a", "europe-west1-b", "asia-southeast1-b"],
+    "network": "default",
+    "image_project": "ubuntu-os-cloud",
+    "image_family": "ubuntu-2204-lts",
+    "disk_size_gb": 200
+  }
+}
+```
+
+然后和 AWS 一样使用 `fab create/start/info/install/kill/stop/destroy`，命令不变：
+
+```bash
+source /Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/activate
+
+fab create --nodes=2
+fab start
+fab info
+fab install
+fab kill
+```
+
+批量三协议脚本可直接走 GCP 入口（功能与 AWS 脚本一致）：
+
+```bash
+python -u /Users/apple/Documents/narwhal/.test/run_triple_gcp_batch_benchmark.py \
+  --nodes=10 \
+  --faults=1,3 \
+  --rate-start=20000 \
+  --rate-step=20000 \
+  --rate-end=220000 \
+  --rounds=2 \
+  --duration=20 \
+  --out-dir=triple_gcp_batch_streamed \
+  --fab-bin=/Users/apple/Documents/narwhal/NovelDAG/benchmark/.venv310/bin/fab \
+  --batch-prefix=triplegcp-streamed \
+  --phase=all \
+  --remote-retries=5 \
+  --retry-delay=15 \
+  --collect-poll-seconds=120
+```
+
+只想用同一脚本也可以：`run_triple_aws_batch_benchmark.py --cloud=gcp ...`。
+
 ## License
 
 This software is licensed as [Apache 2.0](LICENSE).
