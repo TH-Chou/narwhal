@@ -162,25 +162,19 @@ impl Core {
                 break;
             }
 
-            let parents_2 = if round == 1 {
-                self.round_digests(0)
-            } else {
-                self.round_digests(round - 1)
-            };
+            let previous_round = if round == 1 { 0 } else { round - 1 };
+            let parents_2 = self.round_digests(previous_round);
 
-            let parents_2_weight: u32 = parents_2
-                .iter()
-                .filter_map(|digest| {
-                    self.certificates_by_round
-                        .get(&(if round == 1 { 0 } else { round - 1 }))
-                        .and_then(|by_authority| {
-                            by_authority
-                                .values()
-                                .find(|certificate| certificate.digest() == *digest)
-                                .map(|certificate| self.committee.stake(&certificate.origin()))
-                        })
+            let parents_2_weight: u32 = self
+                .certificates_by_round
+                .get(&previous_round)
+                .map(|by_authority| {
+                    by_authority
+                        .keys()
+                        .map(|name| self.committee.stake(name))
+                        .sum()
                 })
-                .sum();
+                .unwrap_or_default();
             if round >= 2 && parents_2_weight < self.committee.quorum_threshold() {
                 break;
             }

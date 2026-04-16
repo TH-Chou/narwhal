@@ -5,6 +5,7 @@ use crate::messages::{Certificate, Header};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
+use futures::future::join_all;
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::Sender;
@@ -93,6 +94,8 @@ impl Synchronizer {
         let mut missing = Vec::new();
         let mut parents_1 = Vec::new();
         let mut parents_2 = Vec::new();
+
+        let mut read_parents_1 = Vec::new();
         for digest in &header.parents {
             if let Some(genesis) = self
                 .genesis
@@ -104,12 +107,19 @@ impl Synchronizer {
                 continue;
             }
 
-            match self.store.read(digest.to_vec()).await? {
-                Some(certificate) => parents_1.push(bincode::deserialize(&certificate)?),
-                None => missing.push(digest.clone()),
-            };
+            let mut store = self.store.clone();
+            let digest = digest.clone();
+            read_parents_1.push(async move { (digest.clone(), store.read(digest.to_vec()).await) });
         }
 
+        for (digest, result) in join_all(read_parents_1).await {
+            match result? {
+                Some(certificate) => parents_1.push(bincode::deserialize(&certificate)?),
+                None => missing.push(digest),
+            }
+        }
+
+        let mut read_parents_2 = Vec::new();
         for digest in &header.parents_2 {
             if let Some(genesis) = self
                 .genesis
@@ -121,10 +131,16 @@ impl Synchronizer {
                 continue;
             }
 
-            match self.store.read(digest.to_vec()).await? {
+            let mut store = self.store.clone();
+            let digest = digest.clone();
+            read_parents_2.push(async move { (digest.clone(), store.read(digest.to_vec()).await) });
+        }
+
+        for (digest, result) in join_all(read_parents_2).await {
+            match result? {
                 Some(certificate) => parents_2.push(bincode::deserialize(&certificate)?),
-                None => missing.push(digest.clone()),
-            };
+                None => missing.push(digest),
+            }
         }
 
         if missing.is_empty() {
